@@ -1,0 +1,116 @@
+# Software Development Workflow
+# Defines phases, dependencies, and exit criteria for software projects
+
+workflow:
+  name: software-development
+  description: Complete software development lifecycle
+  version: "1.0"
+  
+  phases:
+    discovery:
+      order: 1
+      description: Understand requirements and constraints
+      duration_estimate: "10-20% of total time"
+      required: true
+      exit_criteria:
+        - User intent documented
+        - Functional requirements listed
+        - Non-functional requirements identified
+        - Technical constraints noted
+        - Success criteria defined
+      deliverables:
+        - requirements.md
+        - constraints.md
+        - user-stories.md (optional)
+      next_phase: planning
+      
+    planning:
+      order: 2
+      description: Design architecture and plan implementation
+      duration_estimate: "15-25% of total time"
+      required: true
+      exit_criteria:
+        - Architecture decided
+        - Technology stack selected
+        - File structure planned
+        - Implementation steps sequenced
+        - Testing strategy defined
+      deliverables:
+        - architecture.md
+        - implementation-plan.md
+        - tech-spec.md
+      next_phase: execution
+      
+    execution:
+      order: 3
+      description: Write code and implement features
+      duration_estimate: "40-60% of total time"
+      required: true
+      exit_criteria:
+        - All planned features implemented
+        - Code follows project standards
+        - Tests written and passing
+        - Documentation complete
+        - Self-review done
+      deliverables:
+        - Source code
+        - Tests
+        - Documentation
+      next_phase: review
+      
+    review:
+      order: 4
+      description: Quality assurance and refinement
+      duration_estimate: "10-15% of total time"
+      required: true
+      exit_criteria:
+        - Code reviewed (self or peer)
+        - Bugs fixed
+        - Performance checked
+        - Security considered
+        - User feedback addressed
+      deliverables:
+        - review-report.md
+        - bug-fixes.md (if applicable)
+      next_phase: delivery
+      
+    delivery:
+      order: 5
+      description: Final delivery and handoff
+      duration_estimate: "5-10% of total time"
+      required: true
+      exit_criteria:
+        - Final output delivered
+        - Setup instructions provided
+        - Usage examples included
+        - Known issues documented
+        - Session archived
+      deliverables:
+        - final-deliverables.md
+        - setup-guide.md
+        - handoff-notes.md
+      next_phase: null
+      
+  specialist_templates:
+    - web-development
+    - mobile-development
+    - api-development
+    - game-development
+    - devops-sre
+    - tauri-rust
+    - frontend-specialist
+    - authentication-database
+    
+  common_commands:
+    setup: "npm install"
+    dev: "npm run dev"
+    build: "npm run build"
+    test: "npm run test"
+    lint: "npm run lint"
+    typecheck: "npm run type-check"
+    
+  quality_gates:
+    - All tests passing
+    - No lint errors
+    - Type checking passes
+    - Documentation updated

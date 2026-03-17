@@ -1,0 +1,215 @@
+{
+  "version": "1.0",
+  "description": "Shared skills and standards across all specialist templates",
+  
+  "standards": {
+    "documentation": {
+      "name": "Documentation Standards",
+      "description": "Universal documentation requirements",
+      "content": [
+        "All files must include header comments with purpose, author, and last modified date",
+        "README.md required for every module/directory",
+        "Inline comments for complex logic (not obvious operations)",
+        "API documentation for all public interfaces",
+        "Changelog maintained for version tracking"
+      ]
+    },
+    "code_quality": {
+      "name": "Code Quality Standards",
+      "description": "Universal code quality requirements",
+      "content": [
+        "Follow DRY principle - Don't Repeat Yourself",
+        "Functions should do ONE thing (Single Responsibility)",
+        "Maximum function length: 50 lines",
+        "Maximum file length: 500 lines (split if larger)",
+        "Error handling for all external calls and edge cases",
+        "No hardcoded values - use constants/configuration",
+        "Logging for important operations and errors"
+      ]
+    },
+    "security": {
+      "name": "Security Standards",
+      "description": "Universal security requirements",
+      "content": [
+        "No secrets/credentials in code",
+        "Input validation for all user inputs",
+        "Output encoding to prevent injection",
+        "Use parameterized queries (no SQL injection)",
+        "HTTPS for all network communications",
+        "Principle of least privilege for permissions",
+        "Regular dependency updates"
+      ]
+    },
+    "testing": {
+      "name": "Testing Standards",
+      "description": "Universal testing requirements",
+      "content": [
+        "Unit tests for business logic",
+        "Integration tests for API boundaries",
+        "Minimum 80% code coverage",
+        "Test naming: should_[expected_behavior]_when_[condition]",
+        "Mock external dependencies",
+        "CI/CD pipeline runs all tests"
+      ]
+    },
+    "version_control": {
+      "name": "Version Control Standards",
+      "description": "Universal git requirements",
+      "content": [
+        "Meaningful commit messages (imperative mood)",
+        "Atomic commits - one logical change per commit",
+        "Branch naming: feature/, bugfix/, hotfix/",
+        "Pull requests for all changes",
+        "Code review required before merge",
+        "No secrets in git history"
+      ]
+    }
+  },
+  
+  "procedures": {
+    "handoff": {
+      "name": "Phase Handoff Protocol",
+      "description": "Standard procedure for transitioning between phases",
+      "steps": [
+        "Summarize current phase achievements in 3-5 bullet points",
+        "List all artifacts created with file paths",
+        "Document decisions made and their rationale",
+        "Identify blockers or risks for next phase",
+        "Confirm acceptance criteria met",
+        "Get explicit user confirmation to proceed",
+        "Update state with phase completion"
+      ]
+    },
+    "error_recovery": {
+      "name": "Error Recovery Protocol",
+      "description": "Standard error handling procedure",
+      "steps": [
+        "Log error with full context (timestamp, operation, input)",
+        "Assess severity: blocking, warning, or informational",
+        "Attempt automatic recovery if safe",
+        "Notify user of error with clear explanation",
+        "Provide recovery options",
+        "Create checkpoint before retry",
+        "Document resolution for future reference"
+      ]
+    },
+    "context_management": {
+      "name": "Context Management",
+      "description": "Managing context size and relevance",
+      "steps": [
+        "Monitor estimated token usage",
+        "Prune completed phases to summaries when >80% limit",
+        "Keep only current phase in full detail",
+        "Archive detailed phase data to disk",
+        "Load templates selectively by relevance",
+        "Clear temporary calculation contexts"
+      ]
+    }
+  },
+  
+  "common_tools": {
+    "file_operations": {
+      "name": "File Operations",
+      "description": "Standard file handling capabilities",
+      "operations": [
+        "Read/Write text files",
+        "Create/Delete directories",
+        "Search file contents (grep)",
+        "List directory contents",
+        "File metadata (size, modified date)"
+      ]
+    },
+    "shell_commands": {
+      "name": "Shell Commands",
+      "description": "Standard shell execution capabilities",
+      "operations": [
+        "Execute commands with timeout",
+        "Capture stdout/stderr",
+        "Check command existence",
+        "Environment variable access",
+        "Process management (PID, kill)"
+      ],
+      "restrictions": [
+        "NEVER execute destructive operations without confirmation",
+        "NEVER run commands that modify system state without backup",
+        "ALWAYS use --dry-run when available",
+        "ALWAYS validate inputs before shell execution"
+      ]
+    },
+    "code_analysis": {
+      "name": "Code Analysis",
+      "description": "Standard code analysis capabilities",
+      "operations": [
+        "Parse AST for multiple languages",
+        "Identify code smells",
+        "Calculate complexity metrics",
+        "Find unused code",
+        "Check style compliance"
+      ]
+    }
+  },
+  
+  "boundaries": {
+    "universal": {
+      "name": "Universal Boundaries",
+      "description": "Never violate these principles",
+      "rules": [
+        "NEVER guess or hallucinate information",
+        "ALWAYS verify uncertain information",
+        "NEVER execute destructive operations without explicit confirmation",
+        "ALWAYS respect user's authority on business/domain decisions",
+        "NEVER proceed with unclear requirements - ask for clarification",
+        "ALWAYS preserve existing working code unless explicitly asked to change",
+        "NEVER commit or push code without explicit confirmation",
+        "ALWAYS clean up temporary files after use"
+      ]
+    },
+    "security_critical": {
+      "name": "Security Critical",
+      "description": "Security boundaries that are non-negotiable",
+      "rules": [
+        "NEVER expose secrets or credentials",
+        "NEVER disable security features for convenience",
+        "NEVER use eval() or equivalent dangerous functions",
+        "NEVER trust user input without validation",
+        "ALWAYS use allowlists, not denylists",
+        "ALWAYS sanitize data before logging"
+      ]
+    }
+  },
+  
+  "communication": {
+    "progress_updates": {
+      "frequency": "Every 5-10 minutes or after major milestones",
+      "format": [
+        "Current status (what was done)",
+        "Progress indicator (X of Y complete, percentage)",
+        "Next steps (what's coming)",
+        "Blockers (if any)"
+      ]
+    },
+    "decisions": {
+      "format": [
+        "Options considered",
+        "Recommendation with rationale",
+        "Trade-offs",
+        "Request for decision"
+      ]
+    },
+    "questions": {
+      "format": [
+        "Context of the question",
+        "Specific question",
+        "Impact of the answer",
+        "Suggested default if applicable"
+      ]
+    }
+  },
+  
+  "metadata": {
+    "created": "2026-03-17",
+    "author": "Agents Hub System",
+    "version": "1.0",
+    "last_modified": "2026-03-17"
+  }
+}

@@ -1,0 +1,104 @@
+# Research & Analysis Workflow
+# For investigations, data analysis, and research projects
+
+workflow:
+  name: research-analysis
+  description: Structured research and analysis process
+  version: "1.0"
+  
+  phases:
+    discovery:
+      order: 1
+      description: Define research question and scope
+      duration_estimate: "10-15% of total time"
+      required: true
+      exit_criteria:
+        - Research question clear
+        - Scope boundaries set
+        - Methodology selected
+        - Sources identified
+        - Timeline established
+      deliverables:
+        - research-proposal.md
+        - scope-definition.md
+      next_phase: planning
+      
+    planning:
+      order: 2
+      description: Plan research approach and data collection
+      duration_estimate: "15-20% of total time"
+      required: true
+      exit_criteria:
+        - Search strategy defined
+        - Data sources listed
+        - Analysis framework chosen
+        - Tools selected
+        - Quality criteria set
+      deliverables:
+        - research-plan.md
+        - source-list.md
+        - analysis-framework.md
+      next_phase: execution
+      
+    execution:
+      order: 3
+      description: Conduct research and gather data
+      duration_estimate: "40-50% of total time"
+      required: true
+      exit_criteria:
+        - Data collected
+        - Sources documented
+        - Initial analysis complete
+        - Findings organized
+        - Raw data archived
+      deliverables:
+        - research-notes.md
+        - data/
+        - preliminary-findings.md
+      next_phase: review
+      
+    review:
+      order: 4
+      description: Analyze, synthesize, and validate
+      duration_estimate: "15-25% of total time"
+      required: true
+      exit_criteria:
+        - Analysis complete
+        - Findings validated
+        - Patterns identified
+        - Insights extracted
+        - Limitations noted
+      deliverables:
+        - analysis-report.md
+        - fact-check-report.md
+      next_phase: delivery
+      
+    delivery:
+      order: 5
+      description: Present findings and recommendations
+      duration_estimate: "10-15% of total time"
+      required: true
+      exit_criteria:
+        - Report finalized
+        - Visualizations complete
+        - Recommendations clear
+        - Executive summary written
+        - Sources cited properly
+      deliverables:
+        - final-report.md
+        - executive-summary.md
+        - bibliography.md
+      next_phase: null
+      
+  specialist_templates:
+    - research-analyst
+    - data-analyst
+    - business-strategy
+    
+  research_methods:
+    - literature-review
+    - competitive-analysis
+    - market-research
+    - data-analysis
+    - case-study
+    - survey-analysis

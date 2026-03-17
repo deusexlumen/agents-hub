@@ -1,0 +1,259 @@
+# MCP (Model Context Protocol) Configuration
+# https://modelcontextprotocol.io
+
+version: "1.0"
+description: MCP servers configuration for Agents Hub
+
+# ============================================================================
+# MCP Servers
+# ============================================================================
+
+servers:
+  # File System Server - File operations
+  filesystem:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/path/to/allowed/directory"
+    enabled: true
+    description: File system operations (read, write, search)
+    capabilities:
+      - read_file
+      - write_file
+      - list_directory
+      - search_files
+    timeout: 30000
+
+  # GitHub Server - GitHub operations
+  github:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    enabled: true
+    description: GitHub repository operations
+    capabilities:
+      - create_repository
+      - create_issue
+      - create_pull_request
+      - search_code
+      - list_issues
+    timeout: 30000
+
+  # PostgreSQL Server - Database operations
+  postgres:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-postgres"
+      - "${DATABASE_URL}"
+    enabled: false
+    description: PostgreSQL database access
+    capabilities:
+      - query
+      - execute
+    timeout: 30000
+
+  # Brave Search Server - Web search
+  brave-search:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-brave-search"
+    env:
+      BRAVE_API_KEY: ${BRAVE_API_KEY}
+    enabled: true
+    description: Web search via Brave Search API
+    capabilities:
+      - web_search
+      - news_search
+    timeout: 15000
+
+  # Puppeteer Server - Browser automation
+  puppeteer:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-puppeteer"
+    enabled: true
+    description: Browser automation and web scraping
+    capabilities:
+      - navigate
+      - screenshot
+      - click
+      - type
+      - evaluate
+    timeout: 60000
+
+# ============================================================================
+# Local Tools (Built-in)
+# ============================================================================
+
+local_tools:
+  state_manager:
+    enabled: true
+    module: "./core/state-persistence"
+    description: Session state management
+    capabilities:
+      - init_session
+      - load_session
+      - update_phase
+      - create_checkpoint
+      - get_pruned_context
+
+  template_loader:
+    enabled: true
+    module: "./core/template-loader"
+    description: Template loading with shared skills
+    capabilities:
+      - load_template
+      - load_templates
+      - load_relevant_templates
+      - compose_templates
+
+  smart_loader:
+    enabled: true
+    module: "./core/smart-loader"
+    description: Smart context loading
+    capabilities:
+      - load_optimal_context
+      - prune_context
+      - calculate_relevance
+
+  workflow_validator:
+    enabled: true
+    module: "./core/workflow-validator"
+    description: Workflow validation
+    capabilities:
+      - validate_all
+      - validate_workflows
+      - validate_templates
+
+# ============================================================================
+# Tool Routing
+# ============================================================================
+
+routing:
+  # Default server for each capability
+  defaults:
+    file_operations: filesystem
+    git_operations: github
+    web_search: brave-search
+    browser_automation: puppeteer
+    state_management: state_manager
+    template_loading: template_loader
+    context_optimization: smart_loader
+    validation: workflow_validator
+
+  # Capability to server mapping
+  capabilities:
+    read_file: [filesystem, state_manager]
+    write_file: [filesystem]
+    search_files: [filesystem]
+    create_issue: [github]
+    web_search: [brave-search]
+    navigate: [puppeteer]
+    load_template: [template_loader]
+    prune_context: [smart_loader]
+
+# ============================================================================
+# Security Settings
+# ============================================================================
+
+security:
+  # Allowed operations (allowlist approach)
+  allowed_operations:
+    - read_file
+    - write_file
+    - list_directory
+    - search_files
+    - load_template
+    - prune_context
+    - web_search
+    - navigate
+    - screenshot
+
+  # Blocked operations (additional safety)
+  blocked_operations:
+    - delete_file
+    - execute_command
+    - modify_system
+
+  # Confirmation required for these operations
+  require_confirmation:
+    - write_file
+    - create_issue
+    - create_pull_request
+
+  # Maximum file size for read operations (bytes)
+  max_file_size: 1048576  # 1MB
+
+  # Allowed directories for file operations
+  allowed_directories:
+    - "./"
+    - "./templates"
+    - "./workflows"
+    - "./phases"
+    - "./core"
+    - "./session_state"
+
+# ============================================================================
+# Performance Settings
+# ============================================================================
+
+performance:
+  # Cache settings
+  cache:
+    enabled: true
+    ttl_seconds: 300
+    max_size_mb: 100
+
+  # Timeout settings (milliseconds)
+  timeouts:
+    default: 30000
+    file_operations: 10000
+    web_search: 15000
+    browser: 60000
+
+  # Retry settings
+  retry:
+    max_attempts: 3
+    backoff_multiplier: 2
+    initial_delay_ms: 1000
+
+# ============================================================================
+# Error Handling
+# ============================================================================
+
+error_handling:
+  # On timeout
+  on_timeout:
+    action: retry
+    max_retries: 2
+
+  # On connection error
+  on_connection_error:
+    action: fallback
+    fallback_server: local_tools
+
+  # On permission denied
+  on_permission_denied:
+    action: log_and_continue
+    log_level: warning
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+logging:
+  level: info  # debug, info, warning, error
+  file: "./logs/mcp.log"
+  format: "json"  # json, text
+  
+  # What to log
+  log_operations: true
+  log_errors: true
+  log_performance: true

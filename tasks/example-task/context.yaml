@@ -1,0 +1,79 @@
+# Example Task Context
+# Demonstrates the context structure for a task
+
+session:
+  session_id: "example-001"
+  created_at: "2026-03-17T10:00:00Z"
+  last_updated: "2026-03-17T14:00:00Z"
+  status: "completed"
+
+workflow:
+  type: "software-dev"
+  current_phase: "delivery"
+  completed_phases: ["discovery", "planning", "execution", "review"]
+  remaining_phases: []
+
+user:
+  original_request: "Build a simple REST API for a todo app"
+  clarified_intent: "Create Express.js API with CRUD operations for todos"
+  preferences:
+    communication_style: "concise"
+    detail_level: "medium"
+
+requirements:
+  functional:
+    - "GET /todos - List all todos"
+    - "GET /todos/:id - Get single todo"
+    - "POST /todos - Create todo"
+    - "PUT /todos/:id - Update todo"
+    - "DELETE /todos/:id - Delete todo"
+  non_functional:
+    - "Use JSON format"
+    - "In-memory storage (no database)"
+    - "Basic validation"
+  constraints:
+    timeline: "2 hours"
+    tech_stack: ["Node.js", "Express"]
+
+plan:
+  approach: "Simple REST API with in-memory array"
+  architecture: "Single file Express app"
+  implementation_steps:
+    - step: 1
+      task: "Initialize project"
+      status: "complete"
+    - step: 2
+      task: "Create Express server"
+      status: "complete"
+    - step: 3
+      task: "Implement CRUD endpoints"
+      status: "complete"
+    - step: 4
+      task: "Add validation"
+      status: "complete"
+    - step: 5
+      task: "Test endpoints"
+      status: "complete"
+
+deliverables:
+  discovery:
+    - "tasks/example-task/discovery/requirements.md"
+  planning:
+    - "tasks/example-task/planning/architecture.md"
+  execution:
+    - "tasks/example-task/execution/src/server.js"
+    - "tasks/example-task/execution/package.json"
+  review:
+    - "tasks/example-task/review/review-report.md"
+  delivery:
+    - "tasks/example-task/delivery/README.md"
+
+decisions:
+  - timestamp: "2026-03-17T10:15:00Z"
+    phase: "planning"
+    decision: "Use in-memory storage instead of database"
+    rationale: "Faster to implement for simple demo"
+  - timestamp: "2026-03-17T10:20:00Z"
+    phase: "planning"
+    decision: "Single file architecture"
+    rationale: "Simple enough, no need for modular structure"

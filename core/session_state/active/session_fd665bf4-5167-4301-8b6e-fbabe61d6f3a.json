@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "session_id": "fd665bf4-5167-4301-8b6e-fbabe61d6f3a",
+    "created_at": "2026-03-17T14:28:42.058Z",
+    "updated_at": "2026-03-17T14:28:42.062Z",
+    "version": "1.0",
+    "autosave_interval": 300
+  },
+  "context": {
+    "workflow_type": "software-dev",
+    "current_phase": "planning",
+    "completed_phases": [
+      "discovery"
+    ],
+    "user_intent": "Test project",
+    "session_duration_minutes": 0
+  },
+  "phases": {
+    "discovery": {
+      "status": "completed",
+      "data": {},
+      "updated_at": "2026-03-17T14:28:42.060Z",
+      "completed_at": "2026-03-17T14:28:42.060Z"
+    },
+    "planning": {
+      "status": "active",
+      "data": {},
+      "started_at": "2026-03-17T14:28:42.062Z"
+    },
+    "execution": {
+      "status": "pending",
+      "data": {}
+    },
+    "review": {
+      "status": "pending",
+      "data": {}
+    },
+    "delivery": {
+      "status": "pending",
+      "data": {}
+    }
+  },
+  "memory": {
+    "key_decisions": [],
+    "user_preferences": {},
+    "technical_constraints": [],
+    "learned_patterns": [],
+    "phase_summaries": {
+      "discovery": {
+        "phase": "discovery",
+        "status": "completed",
+        "completed_at": "2026-03-17T14:28:42.060Z",
+        "summary": "Phase discovery completed with key outcomes documented.",
+        "artifacts": [],
+        "key_decisions": []
+      }
+    }
+  },
+  "templates": {
+    "loaded": [],
+    "relevant_sections": [],
+    "last_loaded": null
+  },
+  "metrics": {
+    "total_tokens_used": 0,
+    "phases_completed": 1,
+    "context_pruning_events": 0,
+    "errors_encountered": 0
+  }
+}

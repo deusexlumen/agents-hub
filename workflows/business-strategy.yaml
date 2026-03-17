@@ -1,0 +1,103 @@
+# Business Strategy Workflow
+# For strategy, planning, and business analysis
+
+workflow:
+  name: business-strategy
+  description: Strategic planning and business analysis
+  version: "1.0"
+  
+  phases:
+    discovery:
+      order: 1
+      description: Understand business context and goals
+      duration_estimate: "15-20% of total time"
+      required: true
+      exit_criteria:
+        - Business goals clear
+        - Current state assessed
+        - Stakeholders identified
+        - Constraints understood
+        - Success metrics defined
+      deliverables:
+        - business-context.md
+        - stakeholder-map.md
+      next_phase: planning
+      
+    planning:
+      order: 2
+      description: Develop strategic options and plan
+      duration_estimate: "20-30% of total time"
+      required: true
+      exit_criteria:
+        - Market analysis complete
+        - Options generated
+        - Evaluation criteria set
+        - Strategic direction chosen
+        - Implementation roadmap created
+      deliverables:
+        - strategic-plan.md
+        - market-analysis.md
+        - financial-projections.md
+      next_phase: execution
+      
+    execution:
+      order: 3
+      description: Develop detailed plans and models
+      duration_estimate: "30-40% of total time"
+      required: true
+      exit_criteria:
+        - Business case complete
+        - Action plans detailed
+        - Resource requirements defined
+        - Risk mitigation planned
+        - KPIs established
+      deliverables:
+        - business-case.md
+        - action-plans.md
+        - risk-assessment.md
+      next_phase: review
+      
+    review:
+      order: 4
+      description: Validate and refine strategy
+      duration_estimate: "15-20% of total time"
+      required: true
+      exit_criteria:
+        - Strategy validated
+        - Stakeholder feedback incorporated
+        - Financials reviewed
+        - Risks assessed
+        - Plan refined
+      deliverables:
+        - validation-report.md
+        - refined-strategy.md
+      next_phase: delivery
+      
+    delivery:
+      order: 5
+      description: Finalize and present strategy
+      duration_estimate: "10-15% of total time"
+      required: true
+      exit_criteria:
+        - Strategy document finalized
+        - Presentation deck ready
+        - Implementation guide complete
+        - Success metrics clear
+        - Archive complete
+      deliverables:
+        - strategy-document.md
+        - presentation-deck.md
+        - implementation-guide.md
+      next_phase: null
+      
+  specialist_templates:
+    - business-strategy
+    - data-analyst
+    
+  frameworks:
+    - swot-analysis
+    - pestle-analysis
+    - porters-five-forces
+    - business-model-canvas
+    - okr-framework
+    - balanced-scorecard

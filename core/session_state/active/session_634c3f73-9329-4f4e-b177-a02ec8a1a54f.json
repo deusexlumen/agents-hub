@@ -1,0 +1,56 @@
+{
+  "metadata": {
+    "session_id": "634c3f73-9329-4f4e-b177-a02ec8a1a54f",
+    "created_at": "2026-03-17T14:02:06.614Z",
+    "updated_at": "2026-03-17T14:02:06.614Z",
+    "version": "1.0",
+    "autosave_interval": 300
+  },
+  "context": {
+    "workflow_type": "content-creation",
+    "current_phase": "discovery",
+    "completed_phases": [],
+    "user_intent": "Write a blog post about AI",
+    "session_duration_minutes": 0
+  },
+  "phases": {
+    "discovery": {
+      "status": "pending",
+      "data": {}
+    },
+    "planning": {
+      "status": "pending",
+      "data": {}
+    },
+    "execution": {
+      "status": "pending",
+      "data": {}
+    },
+    "review": {
+      "status": "pending",
+      "data": {}
+    },
+    "delivery": {
+      "status": "pending",
+      "data": {}
+    }
+  },
+  "memory": {
+    "key_decisions": [],
+    "user_preferences": {},
+    "technical_constraints": [],
+    "learned_patterns": [],
+    "phase_summaries": {}
+  },
+  "templates": {
+    "loaded": [],
+    "relevant_sections": [],
+    "last_loaded": null
+  },
+  "metrics": {
+    "total_tokens_used": 0,
+    "phases_completed": 0,
+    "context_pruning_events": 0,
+    "errors_encountered": 0
+  }
+}

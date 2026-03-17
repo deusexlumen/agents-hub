@@ -1,0 +1,103 @@
+# Content Creation Workflow
+# For writing, design, video, and creative projects
+
+workflow:
+  name: content-creation
+  description: Content production from ideation to publication
+  version: "1.0"
+  
+  phases:
+    discovery:
+      order: 1
+      description: Understand audience, goals, and requirements
+      duration_estimate: "10-15% of total time"
+      required: true
+      exit_criteria:
+        - Target audience defined
+        - Content goals clear
+        - Tone and style agreed
+        - Platform/channel identified
+        - Key messages outlined
+      deliverables:
+        - content-brief.md
+        - audience-profile.md
+      next_phase: planning
+      
+    planning:
+      order: 2
+      description: Outline structure and create content plan
+      duration_estimate: "15-20% of total time"
+      required: true
+      exit_criteria:
+        - Content structure defined
+        - Key points outlined
+        - Research completed
+        - Assets identified
+        - Timeline set
+      deliverables:
+        - outline.md
+        - content-calendar.md
+        - asset-list.md
+      next_phase: execution
+      
+    execution:
+      order: 3
+      description: Create the content
+      duration_estimate: "40-50% of total time"
+      required: true
+      exit_criteria:
+        - Draft complete
+        - All sections written
+        - Assets created/gathered
+        - Formatting applied
+        - SEO optimized (if applicable)
+      deliverables:
+        - content-draft.md
+        - assets/
+      next_phase: review
+      
+    review:
+      order: 4
+      description: Edit, refine, and polish
+      duration_estimate: "15-20% of total time"
+      required: true
+      exit_criteria:
+        - Content edited
+        - Grammar/spelling checked
+        - Tone consistent
+        - Facts verified
+        - Feedback incorporated
+      deliverables:
+        - edited-content.md
+        - revision-notes.md
+      next_phase: delivery
+      
+    delivery:
+      order: 5
+      description: Publish and distribute
+      duration_estimate: "5-10% of total time"
+      required: true
+      exit_criteria:
+        - Final version delivered
+        - Publication ready
+        - Distribution plan provided
+        - Performance metrics defined
+        - Archive complete
+      deliverables:
+        - final-content.md
+        - publication-guide.md
+      next_phase: null
+      
+  specialist_templates:
+    - content-creator
+    - design-creative
+    - video-production
+    
+  content_types:
+    - blog-post
+    - social-media
+    - email-newsletter
+    - whitepaper
+    - video-script
+    - infographic
+    - presentation
