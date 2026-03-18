@@ -1,0 +1,38 @@
+[
+  {
+    "id": "pattern_1773809518354_ivrysl8s0",
+    "name": "Test Pattern",
+    "description": "",
+    "category": "test",
+    "taskType": "generic",
+    "template": "test-template",
+    "workflow": null,
+    "successRate": 1,
+    "usageCount": 1,
+    "createdAt": "2026-03-18T04:51:58.354Z",
+    "lastUsed": "2026-03-18T04:51:58.355Z",
+    "context": {},
+    "keywords": [],
+    "outcomes": []
+  },
+  {
+    "id": "pattern_1773809518362_niquiang0",
+    "name": "API Pattern",
+    "description": "",
+    "category": "development",
+    "taskType": "generic",
+    "template": "api-development",
+    "workflow": null,
+    "successRate": 1,
+    "usageCount": 1,
+    "createdAt": "2026-03-18T04:51:58.362Z",
+    "lastUsed": "2026-03-18T04:51:58.362Z",
+    "context": {},
+    "keywords": [
+      "api",
+      "rest",
+      "endpoint"
+    ],
+    "outcomes": []
+  }
+]

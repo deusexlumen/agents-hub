@@ -1,0 +1,59 @@
+{
+  "name": "@deusexlumen/agents-hub",
+  "version": "2.0.0",
+  "description": "Dynamic Multi-Agent Orchestration System with State Persistence, Smart Context Loading, and MCP Integration",
+  "main": "index.js",
+  "bin": {
+    "agents-hub": "./bin/agents-hub.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "cd core && node state-persistence.test.js && node template-loader.test.js && node smart-loader.test.js",
+    "validate": "node core/workflow-validator.js",
+    "cli": "node bin/agents-hub.js",
+    "init": "node bin/agents-hub.js init",
+    "status": "node bin/agents-hub.js status",
+    "cleanup": "node -e \"const { StateManager } = require('./core/state-persistence'); new StateManager().cleanup();\""
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "orchestration",
+    "workflow",
+    "state-management",
+    "multi-agent",
+    "automation",
+    "mcp"
+  ],
+  "author": "Deus Ex Lumen <deus@example.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/deusexlumen/agents-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/deusexlumen/agents-hub/issues"
+  },
+  "homepage": "https://github.com/deusexlumen/agents-hub#readme",
+  "dependencies": {
+    "yaml": "^2.3.4",
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "index.js",
+    "bin/",
+    "core/",
+    "templates/",
+    "workflows/",
+    "phases/",
+    "README.md",
+    "LICENSE"
+  ]
+}
