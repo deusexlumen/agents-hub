@@ -7,7 +7,7 @@
  * Provides commands for session management, workflow control, and system operations
  * 
  * @module agents-hub-cli
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 const { Command } = require('commander');
@@ -32,7 +32,7 @@ const program = new Command();
 program
   .name('agents-hub')
   .description('Dynamic Multi-Agent Orchestration System CLI')
-  .version('2.0.0');
+  .version('2.1.0');
 
 // ============================================================================
 // Helper Functions
