@@ -1,8 +1,13 @@
 /**
- * State Persistence Layer
+ * State Persistence Layer v3.0
  * 
- * JSON/YAML-based state management with recovery
- * Compatible with Node.js and browser environments
+ * Strukturiertes State-Management mit:
+ * - Tag-basiertem Parsing (<UPDATE_MEMORY>, <UPDATE_STATE>)
+ * - Atomaren Write-Operationen (temp+rename)
+ * - Session-Recovery
+ * 
+ * @module state-persistence
+ * @version 3.0.0
  */
 
 const fs = require('fs');
@@ -10,20 +15,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 // ============================================================================
-// Configuration
-// ============================================================================
-
-const CONFIG = {
-  STATE_DIR: './session_state',
-  AUTOSAVE_INTERVAL_MS: 5 * 60 * 1000, // 5 minutes
-  MAX_CHECKPOINTS: 10,
-  PRUNE_THRESHOLD_TOKENS: 8000,
-  ARCHIVE_AFTER_DAYS: 30,
-  FORMAT: 'json' // 'json' or 'yaml'
-};
-
-// ============================================================================
-// State Structure Definitions
+// Default State Structure
 // ============================================================================
 
 const DEFAULT_STATE = {
@@ -31,22 +23,22 @@ const DEFAULT_STATE = {
     session_id: null,
     created_at: null,
     updated_at: null,
-    version: '1.0',
-    autosave_interval: CONFIG.AUTOSAVE_INTERVAL_MS / 1000
+    version: '3.0.0',
+    checkpoint_count: 0
   },
   context: {
-    workflow_type: null,
+    workflow_type: 'software-dev',
     current_phase: 'discovery',
     completed_phases: [],
     user_intent: null,
     session_duration_minutes: 0
   },
   phases: {
-    discovery: { status: 'pending', data: {} },
-    planning: { status: 'pending', data: {} },
-    execution: { status: 'pending', data: {} },
-    review: { status: 'pending', data: {} },
-    delivery: { status: 'pending', data: {} }
+    discovery: { status: 'pending', data: {}, started_at: null, completed_at: null },
+    planning: { status: 'pending', data: {}, started_at: null, completed_at: null },
+    execution: { status: 'pending', data: {}, started_at: null, completed_at: null },
+    review: { status: 'pending', data: {}, started_at: null, completed_at: null },
+    delivery: { status: 'pending', data: {}, started_at: null, completed_at: null }
   },
   memory: {
     key_decisions: [],
@@ -62,33 +54,39 @@ const DEFAULT_STATE = {
   },
   metrics: {
     total_tokens_used: 0,
+    total_messages: 0,
     phases_completed: 0,
     context_pruning_events: 0,
-    errors_encountered: 0
+    errors_encountered: 0,
+    checkpoints_created: 0
   }
 };
 
 // ============================================================================
-// StateManager Class
+// State Persistence Class
 // ============================================================================
 
-class StateManager {
+class StatePersistence {
   constructor(config = {}) {
-    this.config = { ...CONFIG, ...config };
+    this.config = {
+      stateDir: config.stateDir || './session_state',
+      autosaveInterval: config.autosaveInterval || 5 * 60 * 1000, // 5 minutes
+      maxCheckpoints: config.maxCheckpoints || 50
+    };
+    
     this.currentState = null;
     this.sessionId = null;
     this.autosaveTimer = null;
-    this.checkpointHistory = [];
     
     this._ensureDirectories();
   }
 
   // -------------------------------------------------------------------------
-  // Initialization
+  // Session Lifecycle
   // -------------------------------------------------------------------------
 
   /**
-   * Initialize a new session
+   * Initialisiert eine neue Session
    */
   initSession(userIntent, workflowType = null) {
     this.sessionId = this._generateSessionId();
@@ -101,36 +99,52 @@ class StateManager {
     this.currentState.context.user_intent = userIntent;
     this.currentState.context.workflow_type = workflowType || this._detectWorkflow(userIntent);
     
+    // Set initial phase
+    this.currentState.phases.discovery.status = 'active';
+    this.currentState.phases.discovery.started_at = now;
+    
     this._persistState();
     this._startAutosave();
     
-    console.log(`[StateManager] Session initialized: ${this.sessionId}`);
+    console.log(`[StatePersistence] Session initialized: ${this.sessionId}`);
     return this.sessionId;
   }
 
   /**
-   * Load existing session
+   * Lädt eine existierende Session
    */
   loadSession(sessionId) {
-    const statePath = path.join(this.config.STATE_DIR, 'active', `session_${sessionId}.json`);
+    // Try exact match first
+    let statePath = path.join(this.config.stateDir, 'active', `session_${sessionId}.json`);
+    
+    // If not found, try partial match
+    if (!fs.existsSync(statePath)) {
+      const candidates = this._findSessionByPartialId(sessionId);
+      if (candidates.length === 1) {
+        statePath = candidates[0];
+      } else if (candidates.length > 1) {
+        throw new Error(`Ambiguous session ID: ${sessionId} matches multiple sessions`);
+      }
+    }
     
     if (!fs.existsSync(statePath)) {
       throw new Error(`Session not found: ${sessionId}`);
     }
     
     this.currentState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    this.sessionId = sessionId;
+    this.sessionId = this.currentState.metadata.session_id;
+    
     this._startAutosave();
     
-    console.log(`[StateManager] Session loaded: ${sessionId}`);
+    console.log(`[StatePersistence] Session loaded: ${this.sessionId}`);
     return this.currentState;
   }
 
   /**
-   * Check for recoverable sessions
+   * Gibt die aktuellen wiederherstellbaren Sessions zurück
    */
-  getRecoveryOptions() {
-    const activeDir = path.join(this.config.STATE_DIR, 'active');
+  getRecoverableSessions() {
+    const activeDir = path.join(this.config.stateDir, 'active');
     
     if (!fs.existsSync(activeDir)) {
       return [];
@@ -152,126 +166,146 @@ class StateManager {
     }).sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
   }
 
+  /**
+   * Schließt die aktuelle Session
+   */
+  closeSession(finalStatus = 'completed') {
+    this._ensureSession();
+    
+    this._stopAutosave();
+    
+    // Final checkpoint
+    this.createCheckpoint('session_closed');
+    
+    // Archive
+    this._archiveSession(finalStatus);
+    
+    const summary = this._generateSessionSummary();
+    
+    this.currentState = null;
+    this.sessionId = null;
+    
+    console.log(`[StatePersistence] Session closed`);
+    return summary;
+  }
+
   // -------------------------------------------------------------------------
   // State Updates
   // -------------------------------------------------------------------------
 
   /**
-   * Update current phase
+   * Wendet Memory-Updates an (aus <UPDATE_MEMORY> Tags)
    */
-  updatePhase(phase, data) {
+  updateMemory(updates) {
     this._ensureSession();
     
-    if (!this.currentState.phases[phase]) {
-      throw new Error(`Unknown phase: ${phase}`);
+    if (!updates || typeof updates !== 'object') {
+      return;
     }
     
-    this.currentState.phases[phase] = {
-      ...this.currentState.phases[phase],
-      ...data,
-      updated_at: new Date().toISOString()
-    };
-    
-    if (data.status === 'completed') {
-      this.currentState.phases[phase].completed_at = new Date().toISOString();
-      this.currentState.context.completed_phases.push(phase);
-      this.currentState.metrics.phases_completed++;
-      
-      // Create checkpoint
-      this.createCheckpoint(`phase_${phase}_completed`);
-    }
-    
-    this._updateTimestamp();
-    this._persistState();
-  }
-
-  /**
-   * Transition to next phase
-   */
-  transitionPhase(fromPhase, toPhase) {
-    this._ensureSession();
-    
-    // Mark current phase complete
-    this.updatePhase(fromPhase, { status: 'completed' });
-    
-    // Create summary before moving on
-    this._summarizePhase(fromPhase);
-    
-    // Update context
-    this.currentState.context.current_phase = toPhase;
-    this.currentState.phases[toPhase].status = 'active';
-    this.currentState.phases[toPhase].started_at = new Date().toISOString();
-    
-    this._updateTimestamp();
-    this._persistState();
-    
-    console.log(`[StateManager] Phase transition: ${fromPhase} → ${toPhase}`);
-  }
-
-  /**
-   * Update context
-   */
-  updateContext(updates) {
-    this._ensureSession();
-    
-    this.currentState.context = {
-      ...this.currentState.context,
-      ...updates
-    };
-    
-    this._updateTimestamp();
-    this._persistState();
-  }
-
-  /**
-   * Add to memory
-   */
-  addToMemory(category, item) {
-    this._ensureSession();
-    
-    if (this.currentState.memory[category]) {
-      if (Array.isArray(this.currentState.memory[category])) {
-        this.currentState.memory[category].push({
-          ...item,
+    // Update key_decisions
+    if (Array.isArray(updates.key_decisions)) {
+      updates.key_decisions.forEach(decision => {
+        this.currentState.memory.key_decisions.push({
+          description: decision,
           timestamp: new Date().toISOString()
         });
-      } else {
-        this.currentState.memory[category] = {
-          ...this.currentState.memory[category],
-          ...item
-        };
+      });
+    }
+    
+    // Update user_preferences
+    if (updates.user_preferences && typeof updates.user_preferences === 'object') {
+      this.currentState.memory.user_preferences = {
+        ...this.currentState.memory.user_preferences,
+        ...updates.user_preferences
+      };
+    }
+    
+    // Update technical_constraints
+    if (Array.isArray(updates.technical_constraints)) {
+      updates.technical_constraints.forEach(constraint => {
+        if (!this.currentState.memory.technical_constraints.includes(constraint)) {
+          this.currentState.memory.technical_constraints.push(constraint);
+        }
+      });
+    }
+    
+    // Update learned_patterns
+    if (Array.isArray(updates.learned_patterns)) {
+      updates.learned_patterns.forEach(pattern => {
+        this.currentState.memory.learned_patterns.push({
+          ...pattern,
+          learned_at: new Date().toISOString()
+        });
+      });
+    }
+    
+    this._updateTimestamp();
+    this._persistState();
+  }
+
+  /**
+   * Wendet State-Updates an (aus <UPDATE_STATE> Tags)
+   */
+  applyStateUpdates(updates) {
+    this._ensureSession();
+    
+    if (!updates || typeof updates !== 'object') {
+      return;
+    }
+    
+    // Update current_phase
+    if (updates.current_phase && this.currentState.phases[updates.current_phase]) {
+      const oldPhase = this.currentState.context.current_phase;
+      const newPhase = updates.current_phase;
+      
+      if (oldPhase !== newPhase) {
+        // Complete old phase
+        this.currentState.phases[oldPhase].status = 'completed';
+        this.currentState.phases[oldPhase].completed_at = new Date().toISOString();
+        this.currentState.context.completed_phases.push(oldPhase);
+        
+        // Activate new phase
+        this.currentState.phases[newPhase].status = 'active';
+        this.currentState.phases[newPhase].started_at = new Date().toISOString();
+        this.currentState.context.current_phase = newPhase;
+        
+        this.currentState.metrics.phases_completed++;
+        
+        console.log(`[StatePersistence] Phase transition: ${oldPhase} → ${newPhase}`);
       }
     }
     
+    // Update phase_data
+    if (updates.phase_data && typeof updates.phase_data === 'object') {
+      Object.entries(updates.phase_data).forEach(([phase, data]) => {
+        if (this.currentState.phases[phase]) {
+          this.currentState.phases[phase].data = {
+            ...this.currentState.phases[phase].data,
+            ...data
+          };
+        }
+      });
+    }
+    
+    // Update metrics
+    if (updates.metrics && typeof updates.metrics === 'object') {
+      this.currentState.metrics = {
+        ...this.currentState.metrics,
+        ...updates.metrics
+      };
+    }
+    
     this._updateTimestamp();
     this._persistState();
   }
 
   /**
-   * Track loaded templates
+   * Erhöht den Message-Counter
    */
-  trackTemplates(loadedTemplates, relevantSections) {
+  incrementMessageCount() {
     this._ensureSession();
-    
-    this.currentState.templates.loaded = loadedTemplates;
-    this.currentState.templates.relevant_sections = relevantSections;
-    this.currentState.templates.last_loaded = new Date().toISOString();
-    
-    this._updateTimestamp();
-    this._persistState();
-  }
-
-  /**
-   * Update metrics
-   */
-  updateMetrics(metrics) {
-    this._ensureSession();
-    
-    this.currentState.metrics = {
-      ...this.currentState.metrics,
-      ...metrics
-    };
-    
+    this.currentState.metrics.total_messages++;
     this._updateTimestamp();
     this._persistState();
   }
@@ -281,7 +315,7 @@ class StateManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Create a checkpoint
+   * Erstellt einen benannten Checkpoint
    */
   createCheckpoint(reason) {
     this._ensureSession();
@@ -295,42 +329,26 @@ class StateManager {
     
     const checkpointId = `checkpoint_${this.sessionId}_${Date.now()}`;
     const checkpointPath = path.join(
-      this.config.STATE_DIR, 
-      'recovery', 
+      this.config.stateDir,
+      'recovery',
       `${checkpointId}.json`
     );
     
-    fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
+    this._atomicWrite(checkpointPath, checkpoint);
     
-    this.checkpointHistory.push({
-      id: checkpointId,
-      timestamp: checkpoint.timestamp,
-      reason: reason
-    });
+    this.currentState.metadata.checkpoint_count++;
+    this.currentState.metrics.checkpoints_created++;
     
-    // Prune old checkpoints
-    if (this.checkpointHistory.length > this.config.MAX_CHECKPOINTS) {
-      const old = this.checkpointHistory.shift();
-      const oldPath = path.join(
-        this.config.STATE_DIR,
-        'recovery',
-        `${old.id}.json`
-      );
-      if (fs.existsSync(oldPath)) {
-        fs.unlinkSync(oldPath);
-      }
-    }
-    
-    console.log(`[StateManager] Checkpoint created: ${reason}`);
+    console.log(`[StatePersistence] Checkpoint created: ${reason}`);
     return checkpointId;
   }
 
   /**
-   * Restore from checkpoint
+   * Stellt aus einem Checkpoint wieder her
    */
   restoreCheckpoint(checkpointId) {
     const checkpointPath = path.join(
-      this.config.STATE_DIR,
+      this.config.stateDir,
       'recovery',
       `${checkpointId}.json`
     );
@@ -346,119 +364,33 @@ class StateManager {
     this._updateTimestamp();
     this._persistState();
     
-    console.log(`[StateManager] Restored from checkpoint: ${checkpointId}`);
+    console.log(`[StatePersistence] Restored from checkpoint: ${checkpointId}`);
     return this.currentState;
   }
 
   // -------------------------------------------------------------------------
-  // Context Pruning
+  // Getters
   // -------------------------------------------------------------------------
 
   /**
-   * Get pruned context for AI consumption
+   * Gibt den aktuellen State zurück
    */
-  getPrunedContext() {
-    this._ensureSession();
-    
-    const pruned = {
-      session_id: this.sessionId,
-      current_phase: this.currentState.context.current_phase,
-      user_intent: this.currentState.context.user_intent,
-      workflow_type: this.currentState.context.workflow_type,
-      current_phase_data: this.currentState.phases[this.currentState.context.current_phase],
-      phase_summaries: {},
-      key_decisions: this.currentState.memory.key_decisions.slice(-5),
-      user_preferences: this.currentState.memory.user_preferences
-    };
-    
-    // Include summaries of completed phases
-    this.currentState.context.completed_phases.forEach(phase => {
-      pruned.phase_summaries[phase] = this.currentState.memory.phase_summaries[phase] || 
-        this._generateSummary(phase);
-    });
-    
-    return pruned;
-  }
-
-  /**
-   * Check if pruning is needed
-   */
-  shouldPrune(estimatedTokens) {
-    return estimatedTokens > this.config.PRUNE_THRESHOLD_TOKENS;
-  }
-
-  // -------------------------------------------------------------------------
-  // Session Management
-  // -------------------------------------------------------------------------
-
-  /**
-   * Close session
-   */
-  closeSession(finalStatus = 'completed') {
-    this._ensureSession();
-    
-    this._stopAutosave();
-    
-    // Final checkpoint
-    this.createCheckpoint('session_closed');
-    
-    // Archive session
-    this._archiveSession(finalStatus);
-    
-    console.log(`[StateManager] Session closed: ${this.sessionId}`);
-    
-    const summary = this._generateSessionSummary();
-    this.currentState = null;
-    this.sessionId = null;
-    
-    return summary;
-  }
-
-  /**
-   * Get current state
-   */
-  getState() {
+  getCurrentState() {
     return this.currentState;
   }
 
   /**
-   * Get session summary
+   * Gibt die Session-ID zurück
    */
-  getSessionSummary() {
-    this._ensureSession();
-    return this._generateSessionSummary();
+  getSessionId() {
+    return this.sessionId;
   }
 
-  // -------------------------------------------------------------------------
-  // Maintenance
-  // -------------------------------------------------------------------------
-
   /**
-   * Clean up old sessions
+   * Gibt die aktuelle Phase zurück
    */
-  cleanup(maxAgeDays = CONFIG.ARCHIVE_AFTER_DAYS) {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - maxAgeDays);
-    
-    const activeDir = path.join(this.config.STATE_DIR, 'active');
-    
-    if (!fs.existsSync(activeDir)) return;
-    
-    const files = fs.readdirSync(activeDir);
-    let cleaned = 0;
-    
-    files.forEach(file => {
-      const filePath = path.join(activeDir, file);
-      const stats = fs.statSync(filePath);
-      
-      if (stats.mtime < cutoff) {
-        fs.unlinkSync(filePath);
-        cleaned++;
-      }
-    });
-    
-    console.log(`[StateManager] Cleaned up ${cleaned} old sessions`);
-    return cleaned;
+  getCurrentPhase() {
+    return this.currentState?.context?.current_phase;
   }
 
   // -------------------------------------------------------------------------
@@ -473,10 +405,9 @@ class StateManager {
 
   _ensureDirectories() {
     const dirs = [
-      path.join(this.config.STATE_DIR, 'active'),
-      path.join(this.config.STATE_DIR, 'archived'),
-      path.join(this.config.STATE_DIR, 'recovery'),
-      path.join(this.config.STATE_DIR, 'artifacts')
+      path.join(this.config.stateDir, 'active'),
+      path.join(this.config.stateDir, 'archived'),
+      path.join(this.config.stateDir, 'recovery')
     ];
     
     dirs.forEach(dir => {
@@ -491,18 +422,18 @@ class StateManager {
   }
 
   _detectWorkflow(intent) {
-    const intent_lower = intent.toLowerCase();
+    const intentLower = intent.toLowerCase();
     
-    if (intent_lower.match(/\b(build|develop|code|program|app|software|api)\b/)) {
+    if (intentLower.match(/\b(code|develop|program|build|app|api|software|debug)\b/)) {
       return 'software-dev';
     }
-    if (intent_lower.match(/\b(write|blog|article|content|copy|marketing)\b/)) {
+    if (intentLower.match(/\b(write|blog|article|content|copy|marketing|text)\b/)) {
       return 'content-creation';
     }
-    if (intent_lower.match(/\b(research|analyze|study|investigate|report)\b/)) {
+    if (intentLower.match(/\b(research|analyze|study|investigate|report|search)\b/)) {
       return 'research-analysis';
     }
-    if (intent_lower.match(/\b(strategy|business|plan|market|growth)\b/)) {
+    if (intentLower.match(/\b(strategy|business|plan|market|growth|startup)\b/)) {
       return 'business-strategy';
     }
     
@@ -520,24 +451,40 @@ class StateManager {
     }
   }
 
+  /**
+   * Atomarer Write: Schreibt in Temp-Datei, dann rename
+   */
   _persistState() {
     if (!this.currentState) return;
     
     const statePath = path.join(
-      this.config.STATE_DIR,
+      this.config.stateDir,
       'active',
       `session_${this.sessionId}.json`
     );
     
-    fs.writeFileSync(statePath, JSON.stringify(this.currentState, null, 2));
+    this._atomicWrite(statePath, this.currentState);
+  }
+
+  _atomicWrite(filePath, data) {
+    const tempPath = `${filePath}.tmp`;
+    
+    // Write to temp file
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
+    
+    // Atomic rename
+    fs.renameSync(tempPath, filePath);
   }
 
   _startAutosave() {
     this._stopAutosave();
-    this.autosaveTimer = setInterval(() => {
-      this._persistState();
-      console.log(`[StateManager] Autosaved: ${this.sessionId}`);
-    }, this.config.AUTOSAVE_INTERVAL_MS);
+    
+    if (this.config.autosaveInterval > 0) {
+      this.autosaveTimer = setInterval(() => {
+        this._persistState();
+        console.log(`[StatePersistence] Autosaved`);
+      }, this.config.autosaveInterval);
+    }
   }
 
   _stopAutosave() {
@@ -547,34 +494,9 @@ class StateManager {
     }
   }
 
-  _summarizePhase(phase) {
-    const phaseData = this.currentState.phases[phase];
-    
-    // In real implementation, this would use AI to summarize
-    // For now, use a placeholder
-    const summary = {
-      phase: phase,
-      status: phaseData.status,
-      completed_at: phaseData.completed_at,
-      summary: `Phase ${phase} completed with key outcomes documented.`,
-      artifacts: phaseData.artifacts || [],
-      key_decisions: phaseData.key_decisions || []
-    };
-    
-    this.currentState.memory.phase_summaries[phase] = summary;
-    return summary;
-  }
-
-  _generateSummary(phase) {
-    return this.currentState.memory.phase_summaries[phase] || {
-      phase: phase,
-      summary: 'Phase completed. Details available in archived state.'
-    };
-  }
-
   _archiveSession(finalStatus) {
     const archiveDir = path.join(
-      this.config.STATE_DIR,
+      this.config.stateDir,
       'archived',
       new Date().toISOString().slice(0, 7) // YYYY-MM
     );
@@ -597,11 +519,11 @@ class StateManager {
       `session_${this.sessionId}.json`
     );
     
-    fs.writeFileSync(archivePath, JSON.stringify(archiveData, null, 2));
+    this._atomicWrite(archivePath, archiveData);
     
     // Remove from active
     const activePath = path.join(
-      this.config.STATE_DIR,
+      this.config.stateDir,
       'active',
       `session_${this.sessionId}.json`
     );
@@ -609,6 +531,20 @@ class StateManager {
     if (fs.existsSync(activePath)) {
       fs.unlinkSync(activePath);
     }
+  }
+
+  _findSessionByPartialId(partialId) {
+    const activeDir = path.join(this.config.stateDir, 'active');
+    
+    if (!fs.existsSync(activeDir)) {
+      return [];
+    }
+    
+    const files = fs.readdirSync(activeDir)
+      .filter(f => f.startsWith('session_') && f.includes(partialId))
+      .map(f => path.join(activeDir, f));
+    
+    return files;
   }
 
   _generateSessionSummary() {
@@ -623,40 +559,7 @@ class StateManager {
   }
 }
 
-// ============================================================================
-// Export
-// ============================================================================
-
 module.exports = {
-  StateManager,
-  DEFAULT_STATE,
-  CONFIG
+  StatePersistence,
+  DEFAULT_STATE
 };
-
-// ============================================================================
-// CLI Usage (if run directly)
-// ============================================================================
-
-if (require.main === module) {
-  const manager = new StateManager();
-  
-  // Example usage
-  console.log('State Persistence Layer v1.0');
-  console.log('============================');
-  
-  // Check for recovery options
-  const recovery = manager.getRecoveryOptions();
-  if (recovery.length > 0) {
-    console.log(`\nFound ${recovery.length} recoverable session(s):`);
-    recovery.forEach((opt, i) => {
-      console.log(`  ${i + 1}. ${opt.user_intent} (${opt.current_phase}) - ${opt.duration_minutes}min`);
-    });
-  } else {
-    console.log('\nNo recoverable sessions found.');
-  }
-  
-  console.log('\nUsage:');
-  console.log('  const { StateManager } = require("./state-persistence");');
-  console.log('  const manager = new StateManager();');
-  console.log('  const sessionId = manager.initSession("Build REST API");');
-}
