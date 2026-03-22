@@ -1,12 +1,224 @@
 /**
- * Multi-Agent Supervisor
+ * Multi-Agent Supervisor v4.0
  * 
- * Orchestrates multiple specialist agents for parallel task execution
- * Implements delegation, coordination, and result aggregation
+ * Refactored: XState FSM v5 mit striktem Handoff-Budget
+ * Verhindert unendliche Handoff-Schleifen durch State-Machine-Guards
+ * 
+ * @module multi-agent-supervisor
+ * @version 4.0.0
  */
 
+const { createMachine, interpret, assign } = require('xstate');
 const { SmartLoader } = require('./smart-loader');
 const { ErrorRecoveryManager } = require('./enhanced-error-recovery');
+
+// ============================================================================
+// XState Finite State Machine für Handoff-Kontrolle (v5 API)
+// ============================================================================
+
+/**
+ * Supervisor State Machine
+ * 
+ * Jeder Agent ist ein State-Node.
+ * Handoff-Transitions inkrementieren handoffCount.
+ * Guard verhindert Transition wenn Budget erschöpft.
+ */
+const supervisorMachine = createMachine({
+  id: 'multiAgentSupervisor',
+  
+  initial: 'idle',
+  
+  context: {
+    handoffCount: 0,
+    maxHandoffs: 5,
+    currentAgent: null,
+    previousAgent: null,
+    taskHistory: [],
+    errorContext: null
+  },
+  
+  states: {
+    // Idle: Wartet auf Initialisierung
+    idle: {
+      on: {
+        INITIALIZE: {
+          target: 'ready',
+          actions: assign({}) // No-op, just transition
+        }
+      }
+    },
+    
+    // Ready: Bereit für Task-Zuweisung
+    ready: {
+      entry: () => console.log('[Supervisor FSM] State: ready'),
+      on: {
+        ASSIGN_TASK: {
+          target: 'assigning',
+          actions: assign({
+            currentAgent: ({ event }) => event.agentId
+          })
+        },
+        SHUTDOWN: {
+          target: 'terminated'
+        }
+      }
+    },
+    
+    // Assigning: Task wird zugewiesen
+    assigning: {
+      entry: ({ context }) => console.log(`[Supervisor FSM] Task assigned to: ${context.currentAgent}`),
+      on: {
+        EXECUTE: {
+          target: 'executing'
+        },
+        HANDOFF: [
+          {
+            target: 'handoff',
+            actions: assign({
+              handoffCount: ({ context }) => context.handoffCount + 1
+            }),
+            guard: ({ context }) => context.handoffCount < context.maxHandoffs
+          },
+          {
+            target: 'escalation',
+            actions: assign({
+              errorContext: ({ context }) => ({
+                message: `Handoff budget exhausted: ${context.handoffCount}/${context.maxHandoffs}`,
+                timestamp: Date.now()
+              })
+            })
+          }
+        ],
+        ERROR: {
+          target: 'error',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Unknown error',
+              timestamp: Date.now()
+            })
+          })
+        }
+      }
+    },
+    
+    // Executing: Agent führt Task aus
+    executing: {
+      entry: ({ context }) => console.log(`[Supervisor FSM] Executing on: ${context.currentAgent}`),
+      on: {
+        COMPLETE: {
+          target: 'ready',
+          actions: assign({
+            handoffCount: 0,
+            taskHistory: ({ context, event }) => [...context.taskHistory, {
+              agent: context.currentAgent,
+              timestamp: Date.now(),
+              result: event.result
+            }]
+          })
+        },
+        HANDOFF: [
+          {
+            target: 'handoff',
+            actions: assign({
+              handoffCount: ({ context }) => context.handoffCount + 1
+            }),
+            guard: ({ context }) => context.handoffCount < context.maxHandoffs
+          },
+          {
+            target: 'escalation',
+            actions: assign({
+              errorContext: ({ context }) => ({
+                message: `Handoff budget exhausted: ${context.handoffCount}/${context.maxHandoffs}`,
+                timestamp: Date.now()
+              })
+            })
+          }
+        ],
+        ERROR: {
+          target: 'error',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Unknown error',
+              timestamp: Date.now()
+            })
+          })
+        }
+      }
+    },
+    
+    // Handoff: Wechsel zu anderem Agent
+    handoff: {
+      entry: ({ context, event }) => {
+        console.log(
+          `[Supervisor FSM] Handoff #${context.handoffCount}/${context.maxHandoffs}: ` +
+          `${context.currentAgent} → ${event.targetAgent || 'unknown'}`
+        );
+      },
+      on: {
+        ASSIGN_TASK: {
+          target: 'assigning',
+          actions: assign({
+            previousAgent: ({ context }) => context.currentAgent,
+            currentAgent: ({ event }) => event.agentId
+          })
+        },
+        ERROR: {
+          target: 'error',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Unknown error',
+              timestamp: Date.now()
+            })
+          })
+        }
+      }
+    },
+    
+    // Error: Fehlerzustand
+    error: {
+      entry: ({ context }) => {
+        console.error(`[Supervisor FSM] Error:`, context.errorContext?.message);
+      },
+      on: {
+        RECOVER: {
+          target: 'ready',
+          actions: assign({
+            errorContext: null,
+            handoffCount: 0
+          })
+        },
+        ESCALATE: {
+          target: 'escalation'
+        }
+      }
+    },
+    
+    // Escalation: Menschliche Intervention erforderlich
+    escalation: {
+      entry: ({ context }) => {
+        console.error(
+          `[Supervisor FSM] 🚨 ESCALATION: ${context.errorContext?.message || 'Unknown issue'}. ` +
+          `Human intervention required.`
+        );
+      },
+      on: {
+        RESOLVE: {
+          target: 'ready',
+          actions: assign({
+            errorContext: null,
+            handoffCount: 0
+          })
+        }
+      }
+    },
+    
+    // Terminated: Supervisor beendet
+    terminated: {
+      type: 'final',
+      entry: () => console.log('[Supervisor FSM] Terminated')
+    }
+  }
+});
 
 // ============================================================================
 // Configuration
@@ -16,7 +228,8 @@ const CONFIG = {
   MAX_PARALLEL_AGENTS: 5,
   AGENT_TIMEOUT_MS: 30000,
   COORDINATION_INTERVAL_MS: 5000,
-  CONFLICT_RESOLUTION: 'hierarchy' // 'hierarchy', 'voting', 'consensus'
+  CONFLICT_RESOLUTION: 'hierarchy',
+  MAX_HANDOFFS: 5 // Sync with FSM default
 };
 
 // ============================================================================
@@ -30,27 +243,20 @@ class Agent {
     this.template = config.template;
     this.capabilities = config.capabilities || [];
     this.priority = config.priority || 0;
-    this.status = 'idle'; // idle, busy, error
+    this.status = 'idle';
     this.currentTask = null;
     this.history = [];
     
-    // Load agent template
     this.loader = new SmartLoader();
     this.context = null;
   }
 
-  /**
-   * Initialize agent with task context
-   */
   async initialize(taskDescription) {
     this.context = this.loader.loadOptimalContext(taskDescription);
     this.status = 'ready';
     return this;
   }
 
-  /**
-   * Execute task
-   */
   async execute(task) {
     this.status = 'busy';
     this.currentTask = task;
@@ -58,7 +264,6 @@ class Agent {
     const startTime = Date.now();
     
     try {
-      // Task execution simulation
       const result = await this._performTask(task);
       
       this.history.push({
@@ -73,6 +278,7 @@ class Agent {
       return {
         success: true,
         agent: this.name,
+        agentId: this.id,
         result
       };
     } catch (error) {
@@ -90,9 +296,6 @@ class Agent {
     }
   }
 
-  /**
-   * Check if agent can handle task
-   */
   canHandle(task) {
     return task.requiredCapabilities.every(cap => 
       this.capabilities.includes(cap)
@@ -104,11 +307,10 @@ class Agent {
   }
 
   async _performTask(task) {
-    // This would be the actual task execution
-    // For now, just return a placeholder
     return {
       taskId: task.id,
       agent: this.name,
+      agentId: this.id,
       output: `Completed by ${this.name}`,
       context: this.context
     };
@@ -127,12 +329,13 @@ class Task {
     this.requiredCapabilities = config.requiredCapabilities || [];
     this.dependencies = config.dependencies || [];
     this.priority = config.priority || 0;
-    this.status = 'pending'; // pending, assigned, running, completed, failed
+    this.status = 'pending';
     this.result = null;
     this.assignedTo = null;
     this.createdAt = Date.now();
     this.startedAt = null;
     this.completedAt = null;
+    this.handoffCount = 0;
   }
 
   _generateId() {
@@ -141,7 +344,7 @@ class Task {
 }
 
 // ============================================================================
-// Multi-Agent Supervisor
+// Multi-Agent Supervisor mit XState Integration
 // ============================================================================
 
 class MultiAgentSupervisor {
@@ -156,7 +359,92 @@ class MultiAgentSupervisor {
       tasksCreated: 0,
       tasksCompleted: 0,
       tasksFailed: 0,
-      totalExecutionTime: 0
+      totalExecutionTime: 0,
+      handoffsPrevented: 0
+    };
+    
+    // XState Service initialisieren (v5 API)
+    this.stateService = interpret(supervisorMachine);
+    
+    // Subscribe to state changes
+    this.stateService.subscribe((state) => {
+      this.currentState = state;
+      const ctx = state.context;
+      console.log(`[Supervisor] State: ${state.value} | Handoffs: ${ctx.handoffCount}/${ctx.maxHandoffs}`);
+    });
+    
+    this.stateService.start();
+    
+    this.currentState = this.stateService.getSnapshot();
+  }
+
+  // -------------------------------------------------------------------------
+  // FSM-Controlled Handoff Logic
+  // -------------------------------------------------------------------------
+
+  /**
+   * Initiiert einen Handoff zu einem anderen Agent
+   * Wird durch FSM-Guards blockiert wenn Budget erschöpft
+   */
+  async initiateHandoff(fromAgentId, toAgentId, task) {
+    const currentState = this.stateService.getSnapshot();
+    
+    // Prüfe ob Handoff erlaubt (via FSM Guard)
+    if (currentState.context.handoffCount >= currentState.context.maxHandoffs) {
+      console.error(`[Supervisor] HANDOFF BLOCKED: Budget exhausted (${currentState.context.handoffCount}/${currentState.context.maxHandoffs})`);
+      this.stats.handoffsPrevented++;
+      
+      // Transition zu Escalation
+      this.stateService.send({ type: 'ESCALATE' });
+      
+      throw new Error(
+        `Infinite loop prevention: Maximum handoffs (${this.config.MAX_HANDOFFS}) exceeded. ` +
+        `Task ${task.id} requires escalation.`
+      );
+    }
+    
+    // Handoff durchführen
+    console.log(`[Supervisor] Initiating handoff: ${fromAgentId} → ${toAgentId}`);
+    
+    this.stateService.send({
+      type: 'HANDOFF',
+      targetAgent: toAgentId
+    });
+    
+    // Neue Zuweisung
+    this.stateService.send({
+      type: 'ASSIGN_TASK',
+      agentId: toAgentId
+    });
+    
+    // Update Task
+    task.handoffCount = (task.handoffCount || 0) + 1;
+    
+    return {
+      success: true,
+      from: fromAgentId,
+      to: toAgentId,
+      handoffNumber: currentState.context.handoffCount + 1
+    };
+  }
+
+  /**
+   * Prüft ob Handoffs noch erlaubt sind
+   */
+  canHandoff() {
+    const state = this.stateService.getSnapshot();
+    return state.context.handoffCount < state.context.maxHandoffs;
+  }
+
+  /**
+   * Gibt aktuelles Handoff-Budget zurück
+   */
+  getHandoffBudget() {
+    const state = this.stateService.getSnapshot();
+    return {
+      used: state.context.handoffCount,
+      max: state.context.maxHandoffs,
+      remaining: state.context.maxHandoffs - state.context.handoffCount
     };
   }
 
@@ -164,9 +452,6 @@ class MultiAgentSupervisor {
   // Agent Management
   // -------------------------------------------------------------------------
 
-  /**
-   * Register an agent
-   */
   registerAgent(agentConfig) {
     const agent = new Agent(agentConfig);
     this.agents.set(agent.id, agent);
@@ -174,9 +459,6 @@ class MultiAgentSupervisor {
     return agent;
   }
 
-  /**
-   * Unregister an agent
-   */
   unregisterAgent(agentId) {
     const agent = this.agents.get(agentId);
     if (agent) {
@@ -185,16 +467,10 @@ class MultiAgentSupervisor {
     }
   }
 
-  /**
-   * Get available agents
-   */
   getAvailableAgents() {
     return [...this.agents.values()].filter(a => a.status === 'idle');
   }
 
-  /**
-   * Find best agent for task
-   */
   findBestAgent(task) {
     const candidates = [...this.agents.values()].filter(agent => 
       agent.status === 'idle' && agent.canHandle(task)
@@ -202,7 +478,6 @@ class MultiAgentSupervisor {
     
     if (candidates.length === 0) return null;
     
-    // Sort by priority (higher is better) and capability match
     candidates.sort((a, b) => {
       const aMatch = a.capabilities.filter(c => task.requiredCapabilities.includes(c)).length;
       const bMatch = b.capabilities.filter(c => task.requiredCapabilities.includes(c)).length;
@@ -215,12 +490,9 @@ class MultiAgentSupervisor {
   }
 
   // -------------------------------------------------------------------------
-  // Task Management
+  // Task Management mit FSM-Integration
   // -------------------------------------------------------------------------
 
-  /**
-   * Create and queue a task
-   */
   createTask(config) {
     const task = new Task(config);
     this.tasks.set(task.id, task);
@@ -229,54 +501,51 @@ class MultiAgentSupervisor {
     
     console.log(`[Supervisor] Task created: ${task.id} (${task.type})`);
     
-    // Try to assign immediately if possible
+    // FSM: Initialisiere wenn nötig
+    if (this.currentState.value === 'idle') {
+      this.stateService.send({ type: 'INITIALIZE' });
+    }
+    
     this._processQueue();
     
     return task;
   }
 
-  /**
-   * Create multiple tasks
-   */
   createTasks(configs) {
     return configs.map(config => this.createTask(config));
   }
 
-  /**
-   * Get task status
-   */
   getTaskStatus(taskId) {
     const task = this.tasks.get(taskId);
     return task ? {
       id: task.id,
       status: task.status,
       assignedTo: task.assignedTo,
-      result: task.result
+      result: task.result,
+      handoffCount: task.handoffCount
     } : null;
   }
 
   // -------------------------------------------------------------------------
-  // Task Execution
+  // Task Execution mit FSM-State-Tracking
   // -------------------------------------------------------------------------
 
-  /**
-   * Start the supervisor
-   */
   start() {
     if (this.running) return;
     
     this.running = true;
+    
+    if (this.currentState.value === 'idle') {
+      this.stateService.send({ type: 'INITIALIZE' });
+    }
+    
     console.log('[Supervisor] Started');
     
-    // Start coordination loop
     this.coordinationInterval = setInterval(() => {
       this._coordinate();
     }, this.config.COORDINATION_INTERVAL_MS);
   }
 
-  /**
-   * Stop the supervisor
-   */
   stop() {
     this.running = false;
     
@@ -284,17 +553,16 @@ class MultiAgentSupervisor {
       clearInterval(this.coordinationInterval);
     }
     
+    this.stateService.send({ type: 'SHUTDOWN' });
+    this.stateService.stop();
+    
     console.log('[Supervisor] Stopped');
   }
 
-  /**
-   * Process task queue
-   */
   _processQueue() {
     while (this.taskQueue.length > 0) {
       const task = this.taskQueue[0];
       
-      // Check dependencies
       const depsSatisfied = task.dependencies.every(depId => {
         const dep = this.tasks.get(depId);
         return dep && dep.status === 'completed';
@@ -302,33 +570,35 @@ class MultiAgentSupervisor {
       
       if (!depsSatisfied) break;
       
-      // Find agent
       const agent = this.findBestAgent(task);
       
-      if (!agent) break; // No available agent
+      if (!agent) break;
       
-      // Assign task
       this.taskQueue.shift();
       this._assignTask(task, agent);
     }
   }
 
-  /**
-   * Assign task to agent
-   */
   async _assignTask(task, agent) {
     task.status = 'assigned';
     task.assignedTo = agent.id;
     
+    // FSM: Zuweisung
+    this.stateService.send({
+      type: 'ASSIGN_TASK',
+      agentId: agent.id
+    });
+    
     console.log(`[Supervisor] Task ${task.id} assigned to ${agent.name}`);
     
     try {
-      // Initialize agent with task context
       await agent.initialize(task.description);
       
-      // Execute with error recovery
       task.status = 'running';
       task.startedAt = Date.now();
+      
+      // FSM: Ausführung
+      this.stateService.send({ type: 'EXECUTE' });
       
       const result = await this.errorRecovery.execute(
         `task_${task.id}`,
@@ -339,7 +609,12 @@ class MultiAgentSupervisor {
         }
       );
       
-      // Success
+      // FSM: Abschluss
+      this.stateService.send({
+        type: 'COMPLETE',
+        result
+      });
+      
       task.status = 'completed';
       task.result = result;
       task.completedAt = Date.now();
@@ -350,7 +625,12 @@ class MultiAgentSupervisor {
       console.log(`[Supervisor] Task ${task.id} completed by ${agent.name}`);
       
     } catch (error) {
-      // Failure
+      // FSM: Fehler
+      this.stateService.send({
+        type: 'ERROR',
+        error
+      });
+      
       task.status = 'failed';
       task.result = { error: error.message };
       task.completedAt = Date.now();
@@ -360,27 +640,29 @@ class MultiAgentSupervisor {
       console.log(`[Supervisor] Task ${task.id} failed: ${error.message}`);
     }
     
-    // Process more tasks
     this._processQueue();
   }
 
-  /**
-   * Coordination loop
-   */
   _coordinate() {
-    // Check for stuck tasks
+    // FSM-State prüfen
+    const state = this.stateService.getSnapshot();
+    
+    if (state.value === 'escalation') {
+      console.warn('[Supervisor] Currently in escalation state - manual intervention required');
+      return;
+    }
+    
+    // Stuck tasks checken
     for (const task of this.tasks.values()) {
       if (task.status === 'running') {
         const elapsed = Date.now() - task.startedAt;
         
         if (elapsed > this.config.AGENT_TIMEOUT_MS * 2) {
-          console.log(`[Supervisor] Task ${task.id} appears stuck, considering reassignment`);
-          // Could implement reassignment logic here
+          console.log(`[Supervisor] Task ${task.id} appears stuck`);
         }
       }
     }
     
-    // Try to process queue
     this._processQueue();
   }
 
@@ -388,9 +670,6 @@ class MultiAgentSupervisor {
   // Result Aggregation
   // -------------------------------------------------------------------------
 
-  /**
-   * Aggregate results from multiple tasks
-   */
   aggregateResults(taskIds, strategy = 'merge') {
     const results = taskIds.map(id => {
       const task = this.tasks.get(id);
@@ -411,20 +690,16 @@ class MultiAgentSupervisor {
 
   _mergeResults(results) {
     const merged = {};
-    
     results.forEach(result => {
       if (typeof result === 'object') {
         Object.assign(merged, result);
       }
     });
-    
     return merged;
   }
 
   _voteResults(results) {
-    // Simple voting - return most common result
     const counts = {};
-    
     results.forEach(result => {
       const key = JSON.stringify(result);
       counts[key] = (counts[key] || 0) + 1;
@@ -440,12 +715,17 @@ class MultiAgentSupervisor {
   // Reporting
   // -------------------------------------------------------------------------
 
-  /**
-   * Get supervisor status
-   */
   getStatus() {
+    const fsmState = this.stateService.getSnapshot();
+    
     return {
       running: this.running,
+      fsmState: fsmState.value,
+      handoffBudget: {
+        used: fsmState.context.handoffCount,
+        max: fsmState.context.maxHandoffs,
+        remaining: fsmState.context.maxHandoffs - fsmState.context.handoffCount
+      },
       agents: {
         total: this.agents.size,
         idle: this.getAvailableAgents().length,
@@ -458,20 +738,26 @@ class MultiAgentSupervisor {
         completed: this.stats.tasksCompleted,
         failed: this.stats.tasksFailed
       },
-      stats: this.stats
+      stats: this.stats,
+      escalation: fsmState.value === 'escalation'
     };
   }
 
-  /**
-   * Print status report
-   */
   printStatus() {
     const status = this.getStatus();
     
     console.log('\n============================');
-    console.log('SUPERVISOR STATUS');
+    console.log('SUPERVISOR STATUS (v4.0 XState)');
     console.log('============================');
+    console.log(`FSM State: ${status.fsmState}`);
     console.log(`Running: ${status.running}`);
+    console.log(`\nHandoff Budget: ${status.handoffBudget.used}/${status.handoffBudget.max} ` +
+      `(remaining: ${status.handoffBudget.remaining})`);
+    
+    if (status.escalation) {
+      console.log('\n🚨 ESCALATION STATE: Manual intervention required');
+    }
+    
     console.log(`\nAgents: ${status.agents.total} total`);
     console.log(`  Idle: ${status.agents.idle}`);
     console.log(`  Busy: ${status.agents.busy}`);
@@ -480,6 +766,7 @@ class MultiAgentSupervisor {
     console.log(`  Running: ${status.tasks.running}`);
     console.log(`  Completed: ${status.tasks.completed}`);
     console.log(`  Failed: ${status.tasks.failed}`);
+    console.log(`\nLoop Prevention: ${status.stats.handoffsPrevented} handoffs blocked`);
     console.log('============================\n');
   }
 }
@@ -492,6 +779,7 @@ module.exports = {
   MultiAgentSupervisor,
   Agent,
   Task,
+  supervisorMachine,
   CONFIG
 };
 
@@ -500,27 +788,31 @@ module.exports = {
 // ============================================================================
 
 if (require.main === module) {
-  console.log('Multi-Agent Supervisor v1.0\n');
+  console.log('Multi-Agent Supervisor v4.0 - XState FSM Edition\n');
+  console.log('Features:');
+  console.log('  - Finite State Machine for deterministic state tracking');
+  console.log('  - Strict handoff budget (max 5) prevents infinite loops');
+  console.log('  - Automatic escalation on budget exhaustion');
+  console.log('  - Guard conditions block transitions when unsafe\n');
   
-  // Example usage
   const supervisor = new MultiAgentSupervisor();
   
   // Register agents
-  const frontendAgent = supervisor.registerAgent({
+  supervisor.registerAgent({
     name: 'Frontend Developer',
     template: 'web-development',
     capabilities: ['frontend', 'react', 'css', 'javascript'],
     priority: 1
   });
   
-  const backendAgent = supervisor.registerAgent({
+  supervisor.registerAgent({
     name: 'Backend Developer',
     template: 'api-development',
     capabilities: ['backend', 'api', 'database', 'nodejs'],
     priority: 1
   });
   
-  const securityAgent = supervisor.registerAgent({
+  supervisor.registerAgent({
     name: 'Security Specialist',
     template: 'security-audit',
     capabilities: ['security', 'auth', 'audit'],
@@ -532,8 +824,8 @@ if (require.main === module) {
     console.log(`  - ${agent.name}: ${agent.capabilities.join(', ')}`);
   }
   
-  // Example: Create parallel tasks
-  console.log('\nExample: Creating tasks...');
+  // Test: Create tasks
+  console.log('\nCreating tasks...');
   
   const tasks = supervisor.createTasks([
     {
@@ -558,6 +850,12 @@ if (require.main === module) {
   // Start supervisor
   supervisor.start();
   
+  // Demo: Handoff budget
+  console.log('\n--- Handoff Budget Demo ---');
+  const budget = supervisor.getHandoffBudget();
+  console.log(`Initial budget: ${budget.used}/${budget.max} used`);
+  console.log(`Can handoff: ${supervisor.canHandoff()}`);
+  
   // Print status
   setTimeout(() => {
     supervisor.printStatus();
@@ -567,7 +865,6 @@ if (require.main === module) {
   console.log('\nUsage:');
   console.log('  const { MultiAgentSupervisor } = require("./multi-agent-supervisor");');
   console.log('  const supervisor = new MultiAgentSupervisor();');
-  console.log('  supervisor.registerAgent({ name: "Dev", capabilities: ["code"] });');
-  console.log('  supervisor.createTask({ type: "code", requiredCapabilities: ["code"] });');
-  console.log('  supervisor.start();');
+  console.log('  supervisor.initiateHandoff(fromId, toId, task); // Budget-checked');
+  console.log('  supervisor.getHandoffBudget(); // {used, max, remaining}');
 }
