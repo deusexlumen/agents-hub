@@ -1,13 +1,13 @@
 /**
- * State Persistence Layer v4.0
+ * State Persistence Layer v4.1
  * 
- * Refactored: Tag-basiertes Parsing ersetzt durch strikt validiertes JSON-Handling
- * - Zod Schema-Validierung für State-Updates
- * - Typensicheres JSON statt Regex-Extraktion
- * - Präzise Exceptions für Orchestrator-Handling
+ * Refactored: Typsichere JSON-Schema-Validierung mit Zod
+ * - Kein Regex-basiertes Tag-Parsing
+ - Strikt validierte State-Updates
+ - Rolling Memory Buffer (max 10 Einträge)
  * 
  * @module state-persistence
- * @version 4.0.0
+ * @version 4.1.0
  */
 
 const fs = require('fs');
@@ -20,60 +20,212 @@ const { z } = require('zod');
 // ============================================================================
 
 /**
- * Schema für Memory-Einträge
+ * Custom Error für State Validation
  */
-const MemoryEntrySchema = z.object({
-  description: z.string(),
-  timestamp: z.string().datetime()
-});
+class StateValidationError extends Error {
+  constructor(message, issues, rawPayload) {
+    super(message);
+    this.name = 'StateValidationError';
+    this.issues = issues;
+    this.rawPayload = rawPayload;
+    this.code = 'STATE_VALIDATION_FAILED';
+  }
 
-/**
- * Schema für gelernte Patterns
- */
-const LearnedPatternSchema = z.object({
-  name: z.string(),
-  description: z.string(),
-  learned_at: z.string().datetime()
-});
+  toJSON() {
+    return {
+      code: this.code,
+      message: this.message,
+      issues: this.issues,
+      suggestion: 'Check schema requirements and retry with valid payload'
+    };
+  }
+}
 
 /**
  * Schema für Memory-Updates
+ * - Array aus maximal 10 Strings
+ * - Jeder String max 1000 Zeichen
  */
 const MemoryUpdateSchema = z.object({
-  key_decisions: z.array(z.string()).optional(),
-  user_preferences: z.record(z.any()).optional(),
-  technical_constraints: z.array(z.string()).optional(),
-  learned_patterns: z.array(
-    z.object({
-      name: z.string(),
-      description: z.string()
-    })
-  ).optional()
-});
-
-/**
- * Schema für State-Updates
- * Ersetzt das alte <UPDATE_STATE> Tag-Parsing
- */
-const StateUpdateSchema = z.object({
-  memory: z.array(z.string()).optional(),
-  state: z.object({}).catchall(z.any()).optional(),
-  current_phase: z.enum(['discovery', 'planning', 'execution', 'review', 'delivery']).optional(),
-  phase_data: z.object({}).catchall(z.any()).optional(),
-  metrics: z.object({}).catchall(z.number()).optional()
-});
-
-/**
- * Schema für vollständige State-Updates (intern)
- */
-const FullStateUpdateSchema = z.object({
-  memory: MemoryUpdateSchema.optional(),
-  state: z.object({
-    current_phase: z.enum(['discovery', 'planning', 'execution', 'review', 'delivery']).optional(),
-    phase_data: z.record(z.any()).optional(),
-    metrics: z.record(z.number()).optional()
+  entries: z.array(
+    z.string()
+      .min(1, 'Memory entry cannot be empty')
+      .max(1000, 'Memory entry exceeds 1000 characters')
+  )
+    .max(10, 'Maximum 10 memory entries allowed per update')
+    .optional(),
+  
+  metadata: z.object({
+    timestamp: z.string().datetime().optional(),
+    source: z.string().max(100).optional()
   }).optional()
 });
+
+/**
+ * Schema für State-Transitions
+ * Pflichtfelder: status, next_action, confidence
+ */
+const StateTransitionSchema = z.object({
+  status: z.enum([
+    'idle',
+    'ready',
+    'assigning',
+    'executing',
+    'handoff',
+    'error',
+    'escalation',
+    'completed',
+    'pending'
+  ], {
+    required_error: 'status is required',
+    invalid_type_error: 'status must be a valid state enum'
+  }),
+  
+  next_action: z.string()
+    .min(1, 'next_action cannot be empty')
+    .max(200, 'next_action exceeds 200 characters'),
+  
+  confidence: z.number()
+    .min(0, 'confidence cannot be negative')
+    .max(1, 'confidence cannot exceed 1.0')
+    .refine((val) => val >= 0 && val <= 1, {
+      message: 'confidence must be between 0 and 1'
+    }),
+  
+  memory: MemoryUpdateSchema.optional(),
+  
+  metadata: z.object({
+    agentId: z.string().optional(),
+    taskId: z.string().optional(),
+    timestamp: z.string().datetime().optional(),
+    version: z.string().default('4.1.0')
+  }).optional()
+});
+
+/**
+ * Schema für vollständigen State
+ */
+const FullStateSchema = z.object({
+  session_id: z.string().uuid(),
+  status: z.enum(['idle', 'ready', 'assigning', 'executing', 'handoff', 'error', 'escalation', 'completed']),
+  next_action: z.string(),
+  confidence: z.number().min(0).max(1),
+  memory: z.object({
+    entries: z.array(z.string()).max(10),
+    maxSize: z.literal(10),
+    currentIndex: z.number().min(0).max(9)
+  }),
+  metadata: z.object({
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    version: z.string()
+  })
+});
+
+// ============================================================================
+// Rolling Memory Buffer Implementation
+// ============================================================================
+
+class RollingMemoryBuffer {
+  constructor(maxSize = 10) {
+    this.maxSize = maxSize;
+    this.entries = [];
+    this.currentIndex = 0;
+  }
+
+  /**
+   * Fügt neue Einträge hinzu, verwirft älteste bei Überlauf
+   */
+  add(newEntries) {
+    if (!Array.isArray(newEntries)) {
+      newEntries = [newEntries];
+    }
+
+    for (const entry of newEntries) {
+      if (this.entries.length < this.maxSize) {
+        this.entries.push(entry);
+      } else {
+        // Rolling: Überschreibe ältesten Eintrag
+        this.entries[this.currentIndex] = entry;
+        this.currentIndex = (this.currentIndex + 1) % this.maxSize;
+      }
+    }
+
+    return this.getEntries();
+  }
+
+  /**
+   * Gibt alle Einträge in chronologischer Reihenfolge zurück
+   * (neueste zuletzt)
+   */
+  getEntries() {
+    if (this.entries.length < this.maxSize) {
+      return [...this.entries];
+    }
+    
+    // Reordere für chronologische Reihenfolge
+    const ordered = [];
+    for (let i = 0; i < this.maxSize; i++) {
+      const idx = (this.currentIndex + i) % this.maxSize;
+      if (this.entries[idx] !== undefined) {
+        ordered.push(this.entries[idx]);
+      }
+    }
+    return ordered;
+  }
+
+  /**
+   * Gibt aktuellsten Eintrag zurück
+   */
+  getLatest() {
+    if (this.entries.length === 0) return null;
+    
+    if (this.entries.length < this.maxSize) {
+      return this.entries[this.entries.length - 1];
+    }
+    
+    const latestIndex = (this.currentIndex - 1 + this.maxSize) % this.maxSize;
+    return this.entries[latestIndex];
+  }
+
+  /**
+   * Löscht alle Einträge
+   */
+  clear() {
+    this.entries = [];
+    this.currentIndex = 0;
+  }
+
+  /**
+   * Gibt aktuelle Größe zurück
+   */
+  size() {
+    return this.entries.length;
+  }
+
+  /**
+   * Serialisiert für State-Speicherung
+   */
+  toJSON() {
+    return {
+      entries: this.getEntries(),
+      maxSize: this.maxSize,
+      currentIndex: this.currentIndex
+    };
+  }
+
+  /**
+   * Lädt aus JSON
+   */
+  static fromJSON(data) {
+    const buffer = new RollingMemoryBuffer(data.maxSize || 10);
+    if (Array.isArray(data.entries)) {
+      buffer.entries = data.entries;
+      buffer.currentIndex = data.currentIndex || 0;
+    }
+    return buffer;
+  }
+}
 
 // ============================================================================
 // Default State Structure
@@ -84,7 +236,7 @@ const DEFAULT_STATE = {
     session_id: null,
     created_at: null,
     updated_at: null,
-    version: '4.0.0',
+    version: '4.1.0',
     checkpoint_count: 0
   },
   context: {
@@ -108,6 +260,7 @@ const DEFAULT_STATE = {
     learned_patterns: [],
     phase_summaries: {}
   },
+  rolling_buffer: null, // Wird in initSession initialisiert
   templates: {
     loaded: [],
     relevant_sections: [],
@@ -124,28 +277,6 @@ const DEFAULT_STATE = {
 };
 
 // ============================================================================
-// Custom Exceptions für Orchestrator
-// ============================================================================
-
-class StateValidationError extends Error {
-  constructor(message, issues) {
-    super(message);
-    this.name = 'StateValidationError';
-    this.issues = issues;
-    this.code = 'VALIDATION_FAILED';
-  }
-}
-
-class StateUpdateError extends Error {
-  constructor(message, cause) {
-    super(message);
-    this.name = 'StateUpdateError';
-    this.cause = cause;
-    this.code = 'UPDATE_FAILED';
-  }
-}
-
-// ============================================================================
 // State Persistence Class
 // ============================================================================
 
@@ -154,228 +285,255 @@ class StatePersistence {
     this.config = {
       stateDir: config.stateDir || './session_state',
       autosaveInterval: config.autosaveInterval || 5 * 60 * 1000,
-      maxCheckpoints: config.maxCheckpoints || 50
+      maxCheckpoints: config.maxCheckpoints || 50,
+      rollingBufferSize: config.rollingBufferSize || 10
     };
     
     this.currentState = null;
     this.sessionId = null;
     this.autosaveTimer = null;
+    this.rollingBuffer = null;
     
     this._ensureDirectories();
   }
 
   // -------------------------------------------------------------------------
-  // NEU: Schema-basierte State-Update-Verarbeitung
+  // NEU: Zod-basierte State-Update-Verarbeitung mit Rolling Buffer
   // -------------------------------------------------------------------------
 
   /**
-   * Verarbeitet State-Updates mit strikter Schema-Validierung
-   * Ersetzt das alte Tag-basierte Parsing (<UPDATE_STATE>, <UPDATE_MEMORY>)
+   * Hauptmethode für State-Updates
+   * Validiert JSON-Payload strikt über Zod Schema
+   * Implementiert Rolling Memory Buffer für Context-Überlauf-Schutz
    * 
-   * @param {Object} payload - Das zu validierende Update-Objekt
+   * @param {Object} jsonPayload - Das zu validierende Update-Objekt
    * @returns {Object} - Das validierte und angewendete Update
-   * @throws {StateValidationError} - Bei Schema-Verletzungen
-   * @throws {StateUpdateError} - Bei Anwendungsfehlern
+   * @throws {StateValidationError} - Bei Schema-Verletzungen mit Details
    */
-  processStateUpdate(payload) {
+  updateState(jsonPayload) {
     this._ensureSession();
 
     try {
       // Strikt validierung mit Zod
-      const validated = StateUpdateSchema.parse(payload);
+      const validated = StateTransitionSchema.parse(jsonPayload);
       
-      // Memory-Updates verarbeiten (Array von Strings)
-      if (validated.memory && Array.isArray(validated.memory)) {
-        validated.memory.forEach(item => {
-          this.currentState.memory.key_decisions.push({
-            description: item,
-            timestamp: new Date().toISOString()
-          });
-        });
+      // Update State-Felder
+      this.currentState.status = validated.status;
+      this.currentState.next_action = validated.next_action;
+      this.currentState.confidence = validated.confidence;
+      
+      // Update Metadata wenn vorhanden
+      if (validated.metadata) {
+        this.currentState.metadata = {
+          ...this.currentState.metadata,
+          ...validated.metadata,
+          updated_at: new Date().toISOString()
+        };
       }
 
-      // State-Updates verarbeiten (Schlüssel-Wert-Paare)
-      if (validated.state && typeof validated.state === 'object') {
-        this._applyStateChanges(validated.state);
+      // Rolling Memory Buffer Update
+      if (validated.memory && validated.memory.entries) {
+        if (!this.rollingBuffer) {
+          this.rollingBuffer = new RollingMemoryBuffer(this.config.rollingBufferSize);
+        }
+        
+        // Füge neue Einträge hinzu (Rolling Buffer verwirft älteste)
+        const added = this.rollingBuffer.add(validated.memory.entries);
+        
+        // Speichere im State
+        this.currentState.rolling_buffer = this.rollingBuffer.toJSON();
+        
+        // Auch in legacy memory übernehmen für Kompatibilität
+        this.currentState.memory.key_decisions = added.map(entry => ({
+          description: entry,
+          timestamp: new Date().toISOString()
+        }));
       }
 
-      // Phase-Updates
-      if (validated.current_phase) {
-        this._transitionPhase(validated.current_phase);
-      }
-
-      // Phase-Daten
-      if (validated.phase_data) {
-        this._updatePhaseData(validated.phase_data);
-      }
-
-      // Metrics
-      if (validated.metrics) {
-        this._updateMetrics(validated.metrics);
-      }
-
+      // Phase-Transition wenn status sich ändert
+      this._handlePhaseTransition(validated.status);
+      
       this._updateTimestamp();
       this._persistState();
 
-      console.log(`[StatePersistence] State update processed successfully`);
-      return validated;
+      console.log(`[StatePersistence] State updated: ${validated.status} → ${validated.next_action} (confidence: ${validated.confidence})`);
+      
+      return {
+        success: true,
+        status: validated.status,
+        next_action: validated.next_action,
+        confidence: validated.confidence,
+        memorySize: this.rollingBuffer ? this.rollingBuffer.size() : 0
+      };
 
     } catch (error) {
       if (error instanceof z.ZodError) {
         const issues = error.issues.map(issue => ({
           path: issue.path.join('.'),
           message: issue.message,
-          code: issue.code
+          code: issue.code,
+          received: issue.received,
+          expected: issue.expected
         }));
         
-        throw new StateValidationError(
-          `State update validation failed: ${issues.map(i => `${i.path}: ${i.message}`).join(', ')}`,
-          issues
+        const validationError = new StateValidationError(
+          `State transition validation failed: ${issues.map(i => `${i.path}: ${i.message}`).join('; ')}`,
+          issues,
+          jsonPayload
         );
+        
+        console.error(`[StatePersistence] Validation failed:`, validationError.toJSON());
+        
+        throw validationError;
       }
       
-      throw new StateUpdateError(
-        `Failed to process state update: ${error.message}`,
-        error
+      // Unbekannter Fehler
+      throw new StateValidationError(
+        `Unexpected error during state update: ${error.message}`,
+        [{ path: 'unknown', message: error.message }],
+        jsonPayload
       );
     }
   }
 
   /**
-   * Validiert ein State-Update ohne es anzuwenden
-   * Nützlich für Pre-flight Checks
+   * Validiert ein State-Update ohne es anzuwenden (Pre-flight Check)
    * 
-   * @param {Object} payload - Das zu validierende Objekt
-   * @returns {Object} - Validation result { valid: boolean, errors?: Array }
+   * @param {Object} jsonPayload - Das zu validierende Objekt
+   * @returns {Object} - Validation result { valid: boolean, data?: Object, errors?: Array }
    */
-  validateStateUpdate(payload) {
-    const result = StateUpdateSchema.safeParse(payload);
+  validateStateUpdate(jsonPayload) {
+    const result = StateTransitionSchema.safeParse(jsonPayload);
     
     if (result.success) {
-      return { valid: true, data: result.data };
+      return { 
+        valid: true, 
+        data: result.data,
+        canApply: this.currentState !== null
+      };
     } else {
       return {
         valid: false,
         errors: result.error.issues.map(issue => ({
           path: issue.path.join('.'),
-          message: issue.message
-        }))
+          message: issue.message,
+          code: issue.code
+        })),
+        suggestion: 'Fix validation errors before retrying'
       };
     }
   }
 
+  /**
+   * Gibt aktuelle Memory-Einträge zurück
+   */
+  getMemoryEntries() {
+    if (!this.rollingBuffer) return [];
+    return this.rollingBuffer.getEntries();
+  }
+
+  /**
+   * Gibt aktuellsten Memory-Eintrag zurück
+   */
+  getLatestMemory() {
+    if (!this.rollingBuffer) return null;
+    return this.rollingBuffer.getLatest();
+  }
+
   // -------------------------------------------------------------------------
-  // State Modification Helpers
+  // Private Helpers
   // -------------------------------------------------------------------------
 
-  _applyStateChanges(stateChanges) {
-    Object.entries(stateChanges).forEach(([key, value]) => {
-      // Nur erlaubte Top-Level-Keys aktualisieren
-      const allowedKeys = ['context', 'templates', 'metrics'];
+  _handlePhaseTransition(newStatus) {
+    const phaseMap = {
+      'discovery': 'discovery',
+      'planning': 'planning',
+      'executing': 'execution',
+      'handoff': 'execution',
+      'completed': 'delivery',
+      'error': 'review',
+      'escalation': 'review'
+    };
+
+    const targetPhase = phaseMap[newStatus];
+    if (!targetPhase) return;
+
+    const currentPhase = this.currentState.context.current_phase;
+    
+    if (currentPhase !== targetPhase && this.currentState.phases[targetPhase]) {
+      // Alte Phase abschließen
+      this.currentState.phases[currentPhase].status = 'completed';
+      this.currentState.phases[currentPhase].completed_at = new Date().toISOString();
+      this.currentState.context.completed_phases.push(currentPhase);
       
-      if (allowedKeys.includes(key) && this.currentState[key]) {
-        if (typeof value === 'object' && !Array.isArray(value)) {
-          this.currentState[key] = {
-            ...this.currentState[key],
-            ...value
-          };
-        } else {
-          this.currentState[key] = value;
-        }
-      }
-    });
-  }
-
-  _transitionPhase(newPhase) {
-    const oldPhase = this.currentState.context.current_phase;
-    
-    if (oldPhase === newPhase) return;
-    
-    if (!this.currentState.phases[newPhase]) {
-      throw new StateUpdateError(`Invalid phase: ${newPhase}`);
+      // Neue Phase aktivieren
+      this.currentState.phases[targetPhase].status = 'active';
+      this.currentState.phases[targetPhase].started_at = new Date().toISOString();
+      this.currentState.context.current_phase = targetPhase;
+      
+      this.currentState.metrics.phases_completed++;
+      
+      console.log(`[StatePersistence] Phase transition: ${currentPhase} → ${targetPhase}`);
     }
-    
-    // Alte Phase abschließen
-    this.currentState.phases[oldPhase].status = 'completed';
-    this.currentState.phases[oldPhase].completed_at = new Date().toISOString();
-    this.currentState.context.completed_phases.push(oldPhase);
-    
-    // Neue Phase aktivieren
-    this.currentState.phases[newPhase].status = 'active';
-    this.currentState.phases[newPhase].started_at = new Date().toISOString();
-    this.currentState.context.current_phase = newPhase;
-    
-    this.currentState.metrics.phases_completed++;
-    
-    console.log(`[StatePersistence] Phase transition: ${oldPhase} → ${newPhase}`);
-  }
-
-  _updatePhaseData(phaseData) {
-    Object.entries(phaseData).forEach(([phase, data]) => {
-      if (this.currentState.phases[phase]) {
-        this.currentState.phases[phase].data = {
-          ...this.currentState.phases[phase].data,
-          ...data
-        };
-      }
-    });
-  }
-
-  _updateMetrics(metrics) {
-    Object.entries(metrics).forEach(([key, value]) => {
-      if (typeof value === 'number' && this.currentState.metrics[key] !== undefined) {
-        this.currentState.metrics[key] = value;
-      }
-    });
   }
 
   // -------------------------------------------------------------------------
-  // Legacy Methods (für Rückwärtskompatibilität)
+  // Legacy Methoden (für Rückwärtskompatibilität)
   // -------------------------------------------------------------------------
 
   /**
-   * @deprecated Verwende stattdessen processStateUpdate()
+   * @deprecated Verwende stattdessen updateState()
    */
   updateMemory(updates) {
-    console.warn('[StatePersistence] updateMemory() is deprecated. Use processStateUpdate() instead.');
+    console.warn('[StatePersistence] updateMemory() is deprecated. Use updateState() with Zod schema.');
     
     if (!updates || typeof updates !== 'object') {
       return;
     }
 
-    const payload = {
-      memory: updates.key_decisions || []
-    };
-
-    // Konvertiere altes Format zu neuem
-    if (updates.user_preferences) {
-      payload.state = { user_preferences: updates.user_preferences };
-    }
-
-    this.processStateUpdate(payload);
+    const entries = updates.key_decisions || [];
+    
+    return this.updateState({
+      status: this.currentState?.status || 'idle',
+      next_action: 'memory_update',
+      confidence: 1.0,
+      memory: {
+        entries: entries.map(e => typeof e === 'string' ? e : e.description || String(e))
+      }
+    });
   }
 
   /**
-   * @deprecated Verwende stattdessen processStateUpdate()
+   * @deprecated Verwende stattdessen updateState()
    */
   applyStateUpdates(updates) {
-    console.warn('[StatePersistence] applyStateUpdates() is deprecated. Use processStateUpdate() instead.');
+    console.warn('[StatePersistence] applyStateUpdates() is deprecated. Use updateState() with Zod schema.');
     
     if (!updates || typeof updates !== 'object') {
       return;
     }
 
-    const payload = {
-      current_phase: updates.current_phase,
-      phase_data: updates.phase_data,
-      metrics: updates.metrics
-    };
+    return this.updateState({
+      status: updates.current_phase || 'idle',
+      next_action: 'state_update',
+      confidence: 0.9,
+      metadata: {
+        phase_data: updates.phase_data,
+        metrics: updates.metrics
+      }
+    });
+  }
 
-    this.processStateUpdate(payload);
+  /**
+   * @deprecated Verwende stattdessen updateState()
+   */
+  processStateUpdate(payload) {
+    console.warn('[StatePersistence] processStateUpdate() is deprecated. Use updateState() with Zod schema.');
+    return this.updateState(payload);
   }
 
   // -------------------------------------------------------------------------
-  // Session Lifecycle (unverändert)
+  // Session Lifecycle
   // -------------------------------------------------------------------------
 
   initSession(userIntent, workflowType = null) {
@@ -388,6 +546,15 @@ class StatePersistence {
     this.currentState.metadata.updated_at = now;
     this.currentState.context.user_intent = userIntent;
     this.currentState.context.workflow_type = workflowType || this._detectWorkflow(userIntent);
+    
+    // Initialisiere Rolling Buffer
+    this.rollingBuffer = new RollingMemoryBuffer(this.config.rollingBufferSize);
+    this.currentState.rolling_buffer = this.rollingBuffer.toJSON();
+    
+    // Initial State
+    this.currentState.status = 'idle';
+    this.currentState.next_action = 'initialize';
+    this.currentState.confidence = 1.0;
     
     this.currentState.phases.discovery.status = 'active';
     this.currentState.phases.discovery.started_at = now;
@@ -415,8 +582,31 @@ class StatePersistence {
       throw new Error(`Session not found: ${sessionId}`);
     }
     
-    this.currentState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    const rawState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    
+    // Validiere geladenen State
+    try {
+      FullStateSchema.parse({
+        session_id: rawState.metadata?.session_id,
+        status: rawState.status || 'idle',
+        next_action: rawState.next_action || 'unknown',
+        confidence: rawState.confidence || 0,
+        memory: rawState.memory || { entries: [], maxSize: 10, currentIndex: 0 },
+        metadata: rawState.metadata
+      });
+    } catch (e) {
+      console.warn('[StatePersistence] Loaded state has validation issues, attempting recovery');
+    }
+    
+    this.currentState = rawState;
     this.sessionId = this.currentState.metadata.session_id;
+    
+    // Restore Rolling Buffer
+    if (this.currentState.rolling_buffer) {
+      this.rollingBuffer = RollingMemoryBuffer.fromJSON(this.currentState.rolling_buffer);
+    } else {
+      this.rollingBuffer = new RollingMemoryBuffer(this.config.rollingBufferSize);
+    }
     
     this._startAutosave();
     
@@ -442,7 +632,10 @@ class StatePersistence {
         updated_at: state.metadata.updated_at,
         current_phase: state.context.current_phase,
         user_intent: state.context.user_intent,
-        duration_minutes: state.context.session_duration_minutes
+        duration_minutes: state.context.session_duration_minutes,
+        status: state.status,
+        next_action: state.next_action,
+        confidence: state.confidence
       };
     }).sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
   }
@@ -459,13 +652,14 @@ class StatePersistence {
     
     this.currentState = null;
     this.sessionId = null;
+    this.rollingBuffer = null;
     
     console.log(`[StatePersistence] Session closed`);
     return summary;
   }
 
   // -------------------------------------------------------------------------
-  // Checkpoints (unverändert)
+  // Checkpoints
   // -------------------------------------------------------------------------
 
   createCheckpoint(reason) {
@@ -509,6 +703,11 @@ class StatePersistence {
     this.currentState = checkpoint.state;
     this.sessionId = checkpoint.session_id;
     
+    // Restore Rolling Buffer
+    if (this.currentState.rolling_buffer) {
+      this.rollingBuffer = RollingMemoryBuffer.fromJSON(this.currentState.rolling_buffer);
+    }
+    
     this._updateTimestamp();
     this._persistState();
     
@@ -517,7 +716,7 @@ class StatePersistence {
   }
 
   // -------------------------------------------------------------------------
-  // Getters (unverändert)
+  // Getters
   // -------------------------------------------------------------------------
 
   getCurrentState() {
@@ -532,6 +731,20 @@ class StatePersistence {
     return this.currentState?.context?.current_phase;
   }
 
+  getRollingBufferStatus() {
+    if (!this.rollingBuffer) {
+      return { size: 0, maxSize: this.config.rollingBufferSize, full: false };
+    }
+    
+    const size = this.rollingBuffer.size();
+    return {
+      size,
+      maxSize: this.rollingBuffer.maxSize,
+      full: size >= this.rollingBuffer.maxSize,
+      entries: this.rollingBuffer.getEntries()
+    };
+  }
+
   incrementMessageCount() {
     this._ensureSession();
     this.currentState.metrics.total_messages++;
@@ -540,7 +753,7 @@ class StatePersistence {
   }
 
   // -------------------------------------------------------------------------
-  // Private Methods (unverändert)
+  // Private Methods
   // -------------------------------------------------------------------------
 
   _ensureSession() {
@@ -599,6 +812,11 @@ class StatePersistence {
 
   _persistState() {
     if (!this.currentState) return;
+    
+    // Update rolling_buffer vor dem Speichern
+    if (this.rollingBuffer) {
+      this.currentState.rolling_buffer = this.rollingBuffer.toJSON();
+    }
     
     const statePath = path.join(
       this.config.stateDir,
@@ -692,8 +910,12 @@ class StatePersistence {
       duration_minutes: this.currentState.context.session_duration_minutes,
       phases_completed: this.currentState.context.completed_phases,
       current_phase: this.currentState.context.current_phase,
+      final_status: this.currentState.status,
+      final_action: this.currentState.next_action,
+      final_confidence: this.currentState.confidence,
       metrics: this.currentState.metrics,
-      key_decisions_count: this.currentState.memory.key_decisions.length
+      key_decisions_count: this.currentState.memory.key_decisions.length,
+      rolling_buffer_size: this.rollingBuffer ? this.rollingBuffer.size() : 0
     };
   }
 }
@@ -704,13 +926,10 @@ class StatePersistence {
 
 module.exports = {
   StatePersistence,
-  DEFAULT_STATE,
-  StateUpdateSchema,
-  MemoryUpdateSchema,
+  RollingMemoryBuffer,
   StateValidationError,
-  StateUpdateError,
-  validateStateUpdate: (payload) => {
-    const result = StateUpdateSchema.safeParse(payload);
-    return result.success ? { valid: true, data: result.data } : { valid: false, errors: result.error.issues };
-  }
+  MemoryUpdateSchema,
+  StateTransitionSchema,
+  FullStateSchema,
+  DEFAULT_STATE
 };
