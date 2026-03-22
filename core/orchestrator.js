@@ -1,8 +1,12 @@
 const { spawn } = require('child_process');
-const { execSync } = require('child_process');
-const fs = require('fs');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs').promises;
 const path = require('path');
 const { Guardrails } = require('./resilient-ops');
+
+// Promisified exec für asynchrone, nicht-blockierende Ausführung
+const execAsync = promisify(exec);
 
 // ============================================================================
 // Token Estimation Utility
@@ -10,23 +14,15 @@ const { Guardrails } = require('./resilient-ops');
 
 /**
  * Schätzt die Token-Anzahl eines Textes
- * Verwendet Zeichen-Heuristik: ~4 Zeichen pro Token (GPT/Claude Durchschnitt)
- * 
- * @param {string} text - Der zu analysierende Text
- * @returns {number} - Geschätzte Token-Anzahl
+ * Verwendet Zeichen-Heuristik: ~4 Zeichen pro Token
  */
 function estimateTokens(text) {
   if (!text || typeof text !== 'string') return 0;
-  // Konservative Schätzung: 4 Zeichen ≈ 1 Token
-  // Dies deckt die meisten Sprachen ab, inkl. Code mit vielen Symbolen
   return Math.ceil(text.length / 4);
 }
 
 /**
  * Berechnet Gesamt-Token-Anzahl eines Context-Arrays
- * 
- * @param {Array} contextArray - Array von {role, content} Objekten
- * @returns {number} - Geschätzte Gesamt-Token
  */
 function estimateContextTokens(contextArray) {
   if (!Array.isArray(contextArray)) return 0;
@@ -36,8 +32,7 @@ function estimateContextTokens(contextArray) {
     if (entry.content) {
       total += estimateTokens(entry.content);
     }
-    // overhead für role/metadata (ca. 4 tokens pro message)
-    total += 4;
+    total += 4; // overhead für role/metadata
   }
   return total;
 }
@@ -49,53 +44,24 @@ function estimateContextTokens(contextArray) {
 /**
  * Komprimiert Context durch Entfernung ältester Einträge
  * Bewahrt immer den ersten Eintrag (System Prompt)
- * 
- * Strategie:
- * 1. System Prompt (Index 0) wird NIEMALS entfernt
- * 2. Entferne älteste Observation/Action Paare zuerst
- * 3. Wenn nötig, fasse mehrere Einträge zusammen
- * 
- * @param {Array} historyArray - Array von Context-Einträgen
- * @param {number} maxTokens - Maximale Token-Anzahl
- * @returns {Array} - Komprimierter Context
  */
 function compressContext(historyArray, maxTokens) {
   if (!Array.isArray(historyArray) || historyArray.length === 0) {
     return historyArray;
   }
 
-  // Berechne aktuelle Token-Anzahl
   let currentTokens = estimateContextTokens(historyArray);
   
-  // Wenn unter Limit, nichts tun
   if (currentTokens <= maxTokens) {
     return historyArray;
   }
 
-  // Kopie erstellen (System Prompt an Index 0 beibehalten)
   const compressed = [...historyArray];
   const systemPrompt = compressed[0];
-  const systemTokens = estimateTokens(systemPrompt.content || '') + 4;
   
-  // Verfügbare Tokens für den Rest
-  const availableTokens = maxTokens - systemTokens - 100; // 100 Puffer
-  
-  if (availableTokens <= 0) {
-    // Edge case: System Prompt allein zu groß
-    console.warn('[ContextCompression] System prompt exceeds token limit');
-    return [systemPrompt];
-  }
-
-  // Entferne älteste Einträge (ab Index 1) bis unter Limit
   while (compressed.length > 1 && estimateContextTokens(compressed) > maxTokens) {
-    // Entferne Eintrag an Index 1 (ältester nach System Prompt)
     const removed = compressed.splice(1, 1)[0];
     console.log(`[ContextCompression] Removed entry: ${removed.role || 'unknown'} (${estimateTokens(removed.content || '')} tokens)`);
-  }
-
-  // Wenn immer noch über Limit, fasse verbleibende zusammen
-  if (estimateContextTokens(compressed) > maxTokens && compressed.length > 2) {
-    return aggressiveCompression(compressed, maxTokens);
   }
 
   console.log(`[ContextCompression] Compressed from ${currentTokens} to ${estimateContextTokens(compressed)} tokens (${historyArray.length} → ${compressed.length} entries)`);
@@ -103,48 +69,8 @@ function compressContext(historyArray, maxTokens) {
   return compressed;
 }
 
-/**
- * Aggressive Kompression: Fasst mehrere Einträge zusammen
- */
-function aggressiveCompression(historyArray, maxTokens) {
-  const systemPrompt = historyArray[0];
-  const rest = historyArray.slice(1);
-  
-  // Gruppiere in Paare (User/Assistant) und fasse zusammen
-  const summarized = [];
-  let buffer = '';
-  
-  for (let i = 0; i < rest.length; i++) {
-    const entry = rest[i];
-    const text = `[${entry.role || 'unknown'}]: ${(entry.content || '').substring(0, 500)}...\n`;
-    
-    if (estimateTokens(buffer + text) > 500 && buffer.length > 0) {
-      // Speichere Buffer und starte neu
-      summarized.push({
-        role: 'assistant',
-        content: `Previous interactions summary:\n${buffer}`
-      });
-      buffer = text;
-    } else {
-      buffer += text;
-    }
-  }
-  
-  if (buffer.length > 0) {
-    summarized.push({
-      role: 'assistant', 
-      content: `Previous interactions summary:\n${buffer}`
-    });
-  }
-
-  const result = [systemPrompt, ...summarized];
-  console.log(`[ContextCompression] Aggressive compression: ${historyArray.length} → ${result.length} entries`);
-  
-  return result;
-}
-
 // ============================================================================
-// ReAct Orchestrator mit Context Window Management
+// ReAct Orchestrator - Vollständig Asynchron mit Retry & Sliding Window
 // ============================================================================
 
 class ReActOrchestrator {
@@ -155,40 +81,53 @@ class ReActOrchestrator {
     
     // Context Window Management
     this.maxContextTokens = config.maxTokens || 4000;
-    this.tokenReserve = config.tokenReserve || 500; // Reserve für Antwort
+    this.tokenReserve = config.tokenReserve || 500;
     this.effectiveMaxTokens = this.maxContextTokens - this.tokenReserve;
+    
+    // Sliding Window für History (max 10 Einträge)
+    this.maxHistoryEntries = config.maxHistoryEntries || 10;
+    this.contextHistory = [];
+    this.systemPrompt = null;
+    
+    // Retry Konfiguration
+    this.maxRetries = config.maxRetries || 3;
+    this.baseDelay = config.baseDelay || 1000;
     
     this.activeProcess = null;
     this.iteration = 0;
-    
-    // Context History für Sliding Window
-    this.contextHistory = [];
-    this.systemPrompt = null;
-    this.maxHistoryEntries = config.maxHistoryEntries || 20;
   }
 
   /**
-   * Haupt-Loop mit Context-Kompression
+   * Haupt-Loop mit asynchroner, nicht-blockierender Ausführung
    */
   async runLoop(userInput) {
     this.iteration = 0;
-    let currentInput = userInput;
     let isComplete = false;
     
     // Initialisiere Context mit System Prompt
-    this._initializeContext(userInput);
+    await this._initializeContext(userInput);
 
     while (!isComplete && this.iteration < this.guardrails.maxIterations) {
       this.iteration++;
       console.log(`\n[Iteration ${this.iteration}/${this.guardrails.maxIterations}]`);
-      console.log(`[Context] ${estimateContextTokens(this.contextHistory)}/${this.maxContextTokens} tokens`);
+      console.log(`[Context] ${estimateContextTokens(this.contextHistory)}/${this.maxContextTokens} tokens, ${this.contextHistory.length} entries`);
       
       // Context vor LLM-Call komprimieren
       this._compressContext();
       
-      const llmOutput = await this.spawnLLM(currentInput);
+      // LLM Call mit Retry
+      let llmOutput;
+      try {
+        llmOutput = await this._executeWithRetry(
+          () => this.spawnLLM(userInput),
+          this.maxRetries
+        );
+      } catch (error) {
+        console.error(`[Orchestrator] LLM call failed after retries: ${error.message}`);
+        break;
+      }
       
-      // Füge LLM Output zur History hinzu
+      // Füge LLM Output zur History hinzu (mit Sliding Window)
       this._addToHistory('assistant', llmOutput);
       
       if (llmOutput.includes('<TASK_COMPLETE>')) {
@@ -197,6 +136,7 @@ class ReActOrchestrator {
         break;
       }
 
+      // Parse Actions
       const actions = this.parseActions(llmOutput);
       
       if (actions.length === 0) {
@@ -204,30 +144,41 @@ class ReActOrchestrator {
         break;
       }
 
+      // Führe Actions asynchron aus
       const observations = [];
       for (const action of actions) {
-        const result = await this.executeAction(action);
-        observations.push({ action, result });
+        try {
+          const result = await this._executeWithRetry(
+            () => this.executeAction(action),
+            this.maxRetries
+          );
+          observations.push({ action, result });
+        } catch (error) {
+          observations.push({ 
+            action, 
+            result: { success: false, output: error.message } 
+          });
+        }
       }
 
-      currentInput = this.buildObservationPrompt(llmOutput, observations);
+      // Baue Observation Prompt
+      const observationPrompt = this.buildObservationPrompt(llmOutput, observations);
       
-      // Füge Observation zur History hinzu
-      this._addToHistory('user', currentInput);
+      // Füge Observation zur History hinzu (mit Sliding Window)
+      this._addToHistory('user', observationPrompt);
     }
 
     if (this.iteration >= this.guardrails.maxIterations) {
       console.log('\n⚠ Max iterations reached');
     }
     
-    // Finaler Context-Report
     console.log(`\n[Final Context] ${estimateContextTokens(this.contextHistory)}/${this.maxContextTokens} tokens, ${this.contextHistory.length} entries`);
   }
 
   /**
    * Initialisiert den Context mit System Prompt
    */
-  _initializeContext(userInput) {
+  async _initializeContext(userInput) {
     this.systemPrompt = {
       role: 'system',
       content: `You are an autonomous agent. Use these actions:
@@ -248,12 +199,19 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
   }
 
   /**
-   * Fügt Eintrag zur History hinzu mit Größen-Check
+   * Fügt Eintrag zur History hinzu mit Sliding Window (max 10 Einträge)
    */
   _addToHistory(role, content) {
     this.contextHistory.push({ role, content });
     
-    // Sofort komprimieren wenn über Limit
+    // Sliding Window: Behalte nur die letzten maxHistoryEntries
+    if (this.contextHistory.length > this.maxHistoryEntries) {
+      // Entferne ältesten Eintrag nach System Prompt (Index 1)
+      const removed = this.contextHistory.splice(1, 1)[0];
+      console.log(`[SlidingWindow] Removed oldest entry: ${removed.role} (${estimateTokens(removed.content)} tokens)`);
+    }
+    
+    // Sofort komprimieren wenn über Token-Limit
     const currentTokens = estimateContextTokens(this.contextHistory);
     if (currentTokens > this.effectiveMaxTokens) {
       console.log(`[Context] Token limit approaching (${currentTokens}/${this.effectiveMaxTokens}), compressing...`);
@@ -263,7 +221,6 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
 
   /**
    * Komprimiert Context vor LLM-Call
-   * WICHTIG: Wird vor JEDEM LLM-Call aufgerufen
    */
   _compressContext() {
     const beforeTokens = estimateContextTokens(this.contextHistory);
@@ -282,13 +239,92 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
   }
 
   /**
-   * LLM Call mit Context-Kompression vor dem Senden
+   * Gibt optimierte History für LLM-Call zurück (max 10 Einträge, formatiert)
    */
-  spawnLLM(input) {
+  _getOptimizedHistory() {
+    // Sicherstellen dass Context komprimiert ist
+    this._compressContext();
+    
+    // Sliding Window: Max 10 Einträge
+    let optimized = this.contextHistory;
+    if (optimized.length > this.maxHistoryEntries) {
+      const systemPrompt = optimized[0];
+      const recent = optimized.slice(-(this.maxHistoryEntries - 1));
+      optimized = [systemPrompt, ...recent];
+    }
+    
+    // Formatiere für LLM
+    const formatted = [];
+    for (const entry of optimized) {
+      switch (entry.role) {
+        case 'system':
+          formatted.push({
+            role: 'system',
+            content: entry.content
+          });
+          break;
+        case 'user':
+          formatted.push({
+            role: 'user',
+            content: entry.content.substring(0, 2000) // Limit content length
+          });
+          break;
+        case 'assistant':
+          formatted.push({
+            role: 'assistant',
+            content: entry.content.substring(0, 3000) // Allow more for assistant
+          });
+          break;
+      }
+    }
+    
+    return formatted;
+  }
+
+  /**
+   * Führt Funktion mit Retry und Exponential Backoff aus
+   * @param {Function} fn - Die auszuführende Funktion
+   * @param {number} maxRetries - Maximale Anzahl Versuche
+   * @returns {Promise} - Ergebnis der Funktion
+   */
+  async _executeWithRetry(fn, maxRetries = 3) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[Retry] Attempt ${attempt}/${maxRetries}`);
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        console.warn(`[Retry] Attempt ${attempt} failed: ${error.message}`);
+        
+        if (attempt < maxRetries) {
+          // Exponential Backoff: 1s, 2s, 4s
+          const delay = this.baseDelay * Math.pow(2, attempt - 1);
+          console.log(`[Retry] Waiting ${delay}ms before retry...`);
+          await this._sleep(delay);
+        }
+      }
+    }
+    
+    throw new Error(`Failed after ${maxRetries} attempts: ${lastError.message}`);
+  }
+
+  /**
+   * Sleep Utility für Backoff
+   */
+  _sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Asynchroner LLM Call mit Context-Kompression
+   */
+  async spawnLLM(input) {
+    // Sicherstellen dass Context komprimiert ist
+    this._compressContext();
+    
     return new Promise((resolve, reject) => {
-      // Sicherstellen dass Context komprimiert ist
-      this._compressContext();
-      
       const outputChunks = [];
       const timeoutId = setTimeout(() => {
         if (this.activeProcess) {
@@ -322,7 +358,7 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
         reject(err);
       });
 
-      // Baue Prompt aus Context History
+      // Baue Prompt aus optimierter History
       const prompt = this._buildPromptFromHistory();
 
       this.activeProcess.stdin.write(prompt, 'utf8');
@@ -331,15 +367,14 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
   }
 
   /**
-   * Baut den finalen Prompt aus der Context History
+   * Baut den finalen Prompt aus der optimierten History
    */
   _buildPromptFromHistory() {
-    // Letzte Sicherheits-Kompression
-    this._compressContext();
+    const optimized = this._getOptimizedHistory();
     
     let prompt = '';
     
-    for (const entry of this.contextHistory) {
+    for (const entry of optimized) {
       switch (entry.role) {
         case 'system':
           prompt += entry.content + '\n\n';
@@ -353,9 +388,9 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
       }
     }
     
-    // Füge Hinweis hinzu wenn Context komprimiert wurde
-    if (this.contextHistory.length < this.iteration * 2 + 1) {
-      prompt += '\n[Note: Earlier parts of this conversation were summarized due to length constraints.]\n\n';
+    // Hinweis wenn Context komprimiert wurde
+    if (this.iteration > this.maxHistoryEntries / 2) {
+      prompt += '\n[Note: Earlier conversation history may have been summarized.]\n\n';
     }
     
     prompt += 'Continue:';
@@ -388,29 +423,39 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
   }
 
   /**
-   * Führt Action aus
+   * Führt Action asynchron aus (NICHT-blockierend)
    */
   async executeAction(action) {
     try {
       switch (action.type) {
         case 'EXECUTE_CMD':
           console.log(`[EXEC] ${action.payload}`);
-          const stdout = execSync(action.payload, { encoding: 'utf8', timeout: 30000 });
+          // ASYNCHRON: execAsync statt execSync
+          const { stdout } = await execAsync(action.payload, { 
+            timeout: 30000,
+            maxBuffer: 1024 * 1024 // 1MB
+          });
           return { success: true, output: stdout };
 
         case 'WRITE_FILE':
           console.log(`[WRITE] ${action.path}`);
-          fs.mkdirSync(path.dirname(action.path), { recursive: true });
-          fs.writeFileSync(action.path, action.content, 'utf8');
+          // ASYNCHRON: fs.promises
+          await fs.mkdir(path.dirname(action.path), { recursive: true });
+          await fs.writeFile(action.path, action.content, 'utf8');
           return { success: true, output: `Wrote ${action.path}` };
 
         case 'READ_FILE':
           console.log(`[READ] ${action.path}`);
-          if (!fs.existsSync(action.path)) {
-            return { success: false, output: `File not found: ${action.path}` };
+          // ASYNCHRON: fs.promises
+          try {
+            const content = await fs.readFile(action.path, 'utf8');
+            return { success: true, output: content };
+          } catch (err) {
+            if (err.code === 'ENOENT') {
+              return { success: false, output: `File not found: ${action.path}` };
+            }
+            throw err;
           }
-          const content = fs.readFileSync(action.path, 'utf8');
-          return { success: true, output: content };
 
         default:
           return { success: false, output: 'Unknown action' };
@@ -428,7 +473,9 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
     for (const obs of observations) {
       prompt += `\nAction: ${obs.action.type}\n`;
       prompt += `Result: ${obs.result.success ? 'SUCCESS' : 'FAILED'}\n`;
-      prompt += `Output: ${obs.result.output.substring(0, 2000)}\n`;
+      // Limit output length
+      const output = obs.result.output.substring(0, 1000);
+      prompt += `Output: ${output}${obs.result.output.length > 1000 ? '...' : ''}\n`;
     }
     prompt += '\nContinue the task. Use actions or mark complete.';
     return prompt;
@@ -443,13 +490,14 @@ Think step by step. Use actions to accomplish the task. Always end with <TASK_CO
       maxTokens: this.maxContextTokens,
       effectiveMaxTokens: this.effectiveMaxTokens,
       entries: this.contextHistory.length,
+      maxHistoryEntries: this.maxHistoryEntries,
       utilization: (estimateContextTokens(this.contextHistory) / this.maxContextTokens * 100).toFixed(1) + '%',
       iterations: this.iteration
     };
   }
 
   /**
-   * Manuelle Context-Kompression (für externe Nutzung)
+   * Manuelle Context-Kompression
    */
   forceCompress() {
     this._compressContext();
