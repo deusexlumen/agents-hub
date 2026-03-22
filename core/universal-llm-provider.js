@@ -1,19 +1,56 @@
 /**
- * Universal LLM Provider
+ * Universal LLM Provider v4.0
  * 
  * Abstraktionsschicht für verschiedene LLM-Backends:
- * - CLI-based (gemini-code, aider, claude-code)
+ * - CLI-based (gemini-code, aider, claude-code) - JETZT mit execa
  * - API-based (OpenAI, Anthropic, Gemini)
  * - Local (Ollama, llama.cpp)
  * 
+ * REFACTORED: Zombie-Prozesse und Deadlocks verhindert durch execa
+ * - Strikte Timeouts (5 Minuten)
+ - Max Buffer (10 MB)
+ * - Saubere Prozess-Terminierung
+ * 
  * @module universal-llm-provider
- * @version 3.0.0
+ * @version 4.0.0
  */
 
-const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+
+// ============================================================================
+// Custom Exceptions für Orchestrator
+// ============================================================================
+
+class LLMExecutionError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'LLMExecutionError';
+    this.cause = cause;
+    this.code = 'LLM_EXECUTION_FAILED';
+  }
+}
+
+class LLMExecutionTimeoutError extends LLMExecutionError {
+  constructor(command, timeoutMs, cause) {
+    super(`LLM execution timeout: ${command} exceeded ${timeoutMs}ms`, cause);
+    this.name = 'LLMExecutionTimeoutError';
+    this.code = 'LLM_TIMEOUT';
+    this.command = command;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+class LLMProcessError extends LLMExecutionError {
+  constructor(message, exitCode, stderr, cause) {
+    super(message, cause);
+    this.name = 'LLMProcessError';
+    this.code = 'LLM_PROCESS_ERROR';
+    this.exitCode = exitCode;
+    this.stderr = stderr;
+  }
+}
 
 // ============================================================================
 // Base Provider Class
@@ -40,6 +77,7 @@ class BaseProvider {
 
 // ============================================================================
 // CLI Provider (gemini-code, aider, claude-code, etc.)
+// REFACTORED: Nutzt jetzt execa statt child_process.spawn
 // ============================================================================
 
 class CLIProvider extends BaseProvider {
@@ -49,133 +87,161 @@ class CLIProvider extends BaseProvider {
     this.command = config.command || 'gemini-code';
     this.args = config.args || [];
     this.activeProcess = null;
+    
+    // Konstanten für Timeout und Buffer
+    this.EXECUTION_TIMEOUT = 300000; // 5 Minuten
+    this.MAX_BUFFER = 10485760;      // 10 MB
   }
 
+  /**
+   * Führt CLI-Befehl mit execa aus
+   * Verhindert Zombie-Prozesse durch saubere Timeout- und Abort-Handling
+   */
   async execute(prompt, options = {}) {
-    const { onData, timeoutMs = 300000 } = options;
+    const { onData } = options;
     
-    return new Promise((resolve, reject) => {
-      const outputChunks = [];
-      let stderrChunks = [];
-      let timeoutId = null;
-      
-      // Prepare command
-      const args = [...this.args];
-      
-      // Spawn the process
-      this.activeProcess = spawn(this.command, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: process.env
-      });
-      
-      // Set timeout
-      if (timeoutMs > 0) {
-        timeoutId = setTimeout(() => {
-          this.abort();
-          reject(new Error(`Execution timeout after ${timeoutMs}ms`));
-        }, timeoutMs);
-      }
-      
-      // Handle stdout
-      this.activeProcess.stdout.on('data', (chunk) => {
-        const data = chunk.toString('utf8');
-        outputChunks.push(data);
-        
-        if (onData) {
-          try { onData(data); } catch (e) {}
-        }
-      });
-      
-      // Handle stderr
-      this.activeProcess.stderr.on('data', (chunk) => {
-        const data = chunk.toString('utf8');
-        stderrChunks.push(data);
-        console.error('[LLM stderr]:', data.substring(0, 500));
-      });
-      
-      // Handle exit
-      this.activeProcess.on('close', (code, signal) => {
-        if (timeoutId) clearTimeout(timeoutId);
-        this.activeProcess = null;
-        
-        if (signal) {
-          reject(new Error(`Process terminated by signal: ${signal}`));
-          return;
-        }
-        
-        const fullOutput = outputChunks.join('');
-        
-        if (code !== 0 && code !== null) {
-          if (fullOutput.length > 0) {
-            console.warn(`[CLIProvider] Non-zero exit code ${code}, but output received`);
-            resolve(fullOutput);
-            return;
-          }
-          reject(new Error(`Process exited with code ${code}`));
-          return;
-        }
-        
-        resolve(fullOutput);
-      });
-      
-      // Handle errors
-      this.activeProcess.on('error', (error) => {
-        if (timeoutId) clearTimeout(timeoutId);
-        this.activeProcess = null;
-        reject(new Error(`Failed to spawn process: ${error.message}`));
+    // Lazy-load execa (ESM-Modul in CommonJS)
+    const { execa } = await import('execa');
+    
+    const args = [...this.args];
+    const controller = new AbortController();
+    let stderrOutput = ''; // Muss außerhalb try definiert sein
+    
+    try {
+      // execa mit strikten Limits
+      this.activeProcess = execa(this.command, args, {
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: this.EXECUTION_TIMEOUT,
+        maxBuffer: this.MAX_BUFFER,
+        cancelSignal: controller.signal,
+        env: process.env,
+        stripFinalNewline: false
       });
       
       // Write prompt to stdin
-      try {
+      if (prompt) {
         this.activeProcess.stdin.write(prompt, 'utf8');
         this.activeProcess.stdin.end();
-      } catch (e) {
-        reject(new Error(`Failed to write to stdin: ${e.message}`));
       }
-    });
-  }
-
-  abort() {
-    if (this.activeProcess) {
-      this.activeProcess.kill('SIGTERM');
-      setTimeout(() => {
-        if (this.activeProcess && !this.activeProcess.killed) {
-          this.activeProcess.kill('SIGKILL');
-        }
-      }, 5000);
+      
+      // Stream-Handling wenn onData Callback vorhanden
+      if (onData && this.activeProcess.stdout) {
+        this.activeProcess.stdout.on('data', (chunk) => {
+          try {
+            onData(chunk.toString('utf8'));
+          } catch (e) {
+            // Callback-Fehler ignorieren
+          }
+        });
+      }
+      
+      // stderr für Logging
+      if (this.activeProcess.stderr) {
+        this.activeProcess.stderr.on('data', (chunk) => {
+          const data = chunk.toString('utf8');
+          stderrOutput += data;
+          console.error('[LLM stderr]:', data.substring(0, 500));
+        });
+      }
+      
+      // Warte auf Ergebnis
+      const result = await this.activeProcess;
+      
+      return result.stdout || '';
+      
+    } catch (error) {
+      // Präzise Fehlerunterscheidung für Orchestrator
+      if (error.isCanceled || error.timedOut) {
+        throw new LLMExecutionTimeoutError(
+          this.command,
+          this.EXECUTION_TIMEOUT,
+          error
+        );
+      }
+      
+      if (error.exitCode !== undefined && error.exitCode !== 0) {
+        throw new LLMProcessError(
+          `Process exited with code ${error.exitCode}: ${error.message}`,
+          error.exitCode,
+          error.stderr || stderrOutput,
+          error
+        );
+      }
+      
+      throw new LLMExecutionError(
+        `LLM execution failed: ${error.message}`,
+        error
+      );
+      
+    } finally {
+      // Cleanup: Signal für AbortController
+      controller.abort();
+      this.activeProcess = null;
     }
   }
 
+  /**
+   * Abbruch des aktiven Prozesses
+   * Nutzt AbortController für saubere Terminierung
+   */
+  abort() {
+    if (this.activeProcess) {
+      try {
+        // AbortController signalisiert Abbruch
+        // execa handled die Prozess-Terminierung
+        this.activeProcess.kill('SIGTERM');
+      } catch (e) {
+        // Prozess bereits beendet
+      }
+    }
+  }
+
+  /**
+   * Prüft Verfügbarkeit des CLI-Tools
+   * REFACTORED: Nutzt execa statt spawn
+   */
   async checkAvailability() {
-    return new Promise((resolve) => {
-      const proc = spawn(this.command, ['--version'], {
-        stdio: 'pipe',
-        timeout: 5000
+    try {
+      const { execa } = await import('execa');
+      
+      const result = await execa(this.command, ['--version'], {
+        timeout: 5000,
+        maxBuffer: 1024 * 1024, // 1 MB für Version reicht
+        reject: false // Nicht werfen bei Exit-Code != 0
       });
       
-      let output = '';
-      proc.stdout.on('data', (d) => output += d);
+      return {
+        available: result.exitCode === 0,
+        version: result.stdout?.trim() || 'unknown',
+        command: this.command,
+        exitCode: result.exitCode
+      };
       
-      proc.on('close', (code) => {
-        resolve({
-          available: code === 0,
-          version: output.trim(),
-          command: this.command
-        });
-      });
-      
-      proc.on('error', () => {
-        resolve({
+    } catch (error) {
+      // Timeout oder anderer Fehler
+      if (error.timedOut) {
+        return {
           available: false,
-          error: `Command '${this.command}' not found`
-        });
-      });
-    });
+          error: `Command '${this.command}' timed out during version check`,
+          command: this.command
+        };
+      }
+      
+      return {
+        available: false,
+        error: `Command '${this.command}' not found or not executable`,
+        command: this.command,
+        details: error.message
+      };
+    }
   }
 }
 
 // ============================================================================
 // HTTP/API Provider (OpenAI, Anthropic, Gemini, etc.)
+// UNVERÄNDERT: HTTP-Requests nutzen bereits native Timeout-Handling
 // ============================================================================
 
 class APIProvider extends BaseProvider {
@@ -187,10 +253,12 @@ class APIProvider extends BaseProvider {
     this.model = config.model || 'gpt-4';
     this.endpoint = config.endpoint || '/v1/chat/completions';
     this.activeRequest = null;
+    
+    this.EXECUTION_TIMEOUT = 300000; // 5 Minuten
   }
 
   async execute(prompt, options = {}) {
-    const { onData, timeoutMs = 300000 } = options;
+    const { onData } = options;
     
     return new Promise((resolve, reject) => {
       const url = new URL(this.endpoint, this.baseUrl);
@@ -213,7 +281,7 @@ class APIProvider extends BaseProvider {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Length': Buffer.byteLength(postData)
         },
-        timeout: timeoutMs
+        timeout: this.EXECUTION_TIMEOUT
       };
       
       const protocol = url.protocol === 'https:' ? https : http;
@@ -222,7 +290,7 @@ class APIProvider extends BaseProvider {
         let data = '';
         
         if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+          reject(new LLMExecutionError(`HTTP ${res.statusCode}: ${res.statusMessage}`));
           return;
         }
         
@@ -274,12 +342,16 @@ class APIProvider extends BaseProvider {
       
       this.activeRequest.on('error', (error) => {
         this.activeRequest = null;
-        reject(new Error(`Request failed: ${error.message}`));
+        reject(new LLMExecutionError(`Request failed: ${error.message}`, error));
       });
       
       this.activeRequest.on('timeout', () => {
         this.activeRequest.destroy();
-        reject(new Error('Request timeout'));
+        reject(new LLMExecutionTimeoutError(
+          `${this.baseUrl}${this.endpoint}`,
+          this.EXECUTION_TIMEOUT,
+          new Error('HTTP request timeout')
+        ));
       });
       
       this.activeRequest.write(postData);
@@ -343,6 +415,7 @@ class APIProvider extends BaseProvider {
 
 // ============================================================================
 // Ollama Provider (Local LLMs)
+// UNVERÄNDERT: HTTP-Requests nutzen bereits native Timeout-Handling
 // ============================================================================
 
 class OllamaProvider extends BaseProvider {
@@ -352,10 +425,12 @@ class OllamaProvider extends BaseProvider {
     this.baseUrl = config.baseUrl || 'http://localhost:11434';
     this.model = config.model || 'llama2';
     this.activeRequest = null;
+    
+    this.EXECUTION_TIMEOUT = 300000; // 5 Minuten
   }
 
   async execute(prompt, options = {}) {
-    const { onData, timeoutMs = 300000 } = options;
+    const { onData } = options;
     
     return new Promise((resolve, reject) => {
       const url = new URL('/api/generate', this.baseUrl);
@@ -375,14 +450,14 @@ class OllamaProvider extends BaseProvider {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postData)
         },
-        timeout: timeoutMs
+        timeout: this.EXECUTION_TIMEOUT
       };
       
       this.activeRequest = http.request(url, requestOptions, (res) => {
         let data = '';
         
         if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}`));
+          reject(new LLMExecutionError(`HTTP ${res.statusCode}`));
           return;
         }
         
@@ -421,7 +496,7 @@ class OllamaProvider extends BaseProvider {
       
       this.activeRequest.on('error', (error) => {
         this.activeRequest = null;
-        reject(new Error(`Ollama request failed: ${error.message}`));
+        reject(new LLMExecutionError(`Ollama request failed: ${error.message}`, error));
       });
       
       this.activeRequest.write(postData);
@@ -536,19 +611,58 @@ class LLMProviderFactory {
     return 'cli';
   }
   
-  static listAvailableProviders() {
+  /**
+   * Listet verfügbare Provider auf
+   * REFACTORED: Nutzt execa statt child_process.execSync
+   */
+  static async listAvailableProviders() {
     const providers = [];
     
-    // Check CLI
-    const { execSync } = require('child_process');
+    // Lazy-load execa
+    let execa;
+    try {
+      const execaModule = await import('execa');
+      execa = execaModule.execa;
+    } catch {
+      // execa nicht verfügbar, Fallback zu basic checks
+    }
+    
+    // Check CLI tools
     const cliTools = ['gemini-code', 'aider', 'claude-code', 'codex'];
-    for (const tool of cliTools) {
-      try {
-        execSync(`which ${tool}`, { stdio: 'ignore' });
-        providers.push({ type: 'cli', name: tool, available: true });
-      } catch {
-        providers.push({ type: 'cli', name: tool, available: false });
-      }
+    
+    if (execa) {
+      // Parallel checks mit execa
+      const cliChecks = await Promise.all(
+        cliTools.map(async (tool) => {
+          try {
+            const result = await execa('which', [tool], {
+              timeout: 5000,
+              reject: false
+            });
+            return {
+              type: 'cli',
+              name: tool,
+              available: result.exitCode === 0
+            };
+          } catch {
+            return {
+              type: 'cli',
+              name: tool,
+              available: false
+            };
+          }
+        })
+      );
+      providers.push(...cliChecks);
+    } else {
+      // Fallback: Keine CLI checks möglich ohne execa
+      cliTools.forEach(tool => {
+        providers.push({
+          type: 'cli',
+          name: tool,
+          available: null // Unknown
+        });
+      });
     }
     
     // Check API keys
@@ -569,22 +683,33 @@ class LLMProviderFactory {
     });
     
     // Check Ollama
-    const http = require('http');
-    const req = http.get('http://localhost:11434/api/tags', (res) => {
-      providers.push({ 
-        type: 'local', 
-        name: 'Ollama', 
-        available: res.statusCode === 200 
+    const ollamaCheck = new Promise((resolve) => {
+      const req = http.get('http://localhost:11434/api/tags', { timeout: 5000 }, (res) => {
+        resolve({ 
+          type: 'local', 
+          name: 'Ollama', 
+          available: res.statusCode === 200 
+        });
       });
-    });
-    req.on('error', () => {
-      providers.push({ 
-        type: 'local', 
-        name: 'Ollama', 
-        available: false 
+      req.on('error', () => {
+        resolve({ 
+          type: 'local', 
+          name: 'Ollama', 
+          available: false 
+        });
       });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ 
+          type: 'local', 
+          name: 'Ollama', 
+          available: false 
+        });
+      });
+      req.end();
     });
-    req.end();
+    
+    providers.push(await ollamaCheck);
     
     return providers;
   }
@@ -599,5 +724,8 @@ module.exports = {
   CLIProvider,
   APIProvider,
   OllamaProvider,
-  LLMProviderFactory
+  LLMProviderFactory,
+  LLMExecutionError,
+  LLMExecutionTimeoutError,
+  LLMProcessError
 };
