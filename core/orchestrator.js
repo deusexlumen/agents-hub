@@ -1,517 +1,829 @@
-const { spawn } = require('child_process');
-const { exec } = require('child_process');
-const { promisify } = require('util');
-const fs = require('fs').promises;
-const path = require('path');
-const { Guardrails } = require('./resilient-ops');
+/**
+ * Graph-Based Orchestrator v3.0
+ * 
+ * LangGraph-inspired graph-based orchestration for multi-agent systems
+ * - Node-Edge architecture with explicit state transitions
+ * - Cycle control with max_iterations guard
+ * - Typed handovers with input/output contracts
+ * - Checkpointing for fault tolerance
+ * 
+ * @module orchestrator
+ * @version 3.0.0
+ */
 
-// Promisified exec für asynchrone, nicht-blockierende Ausführung
-const execAsync = promisify(exec);
+import { spawn } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
+import { Logger } from './logger.js';
+import { StatePersistence } from './state-persistence.js';
+
+// Promisified utilities
+const sleep = promisify(setTimeout);
 
 // ============================================================================
-// Token Estimation Utility
+// Graph State Management
 // ============================================================================
 
 /**
- * Schätzt die Token-Anzahl eines Textes
- * Verwendet Zeichen-Heuristik: ~4 Zeichen pro Token
+ * GlobalState - Thread-safe state container passed through all nodes
  */
-function estimateTokens(text) {
-  if (!text || typeof text !== 'string') return 0;
-  return Math.ceil(text.length / 4);
-}
-
-/**
- * Berechnet Gesamt-Token-Anzahl eines Context-Arrays
- */
-function estimateContextTokens(contextArray) {
-  if (!Array.isArray(contextArray)) return 0;
-  
-  let total = 0;
-  for (const entry of contextArray) {
-    if (entry.content) {
-      total += estimateTokens(entry.content);
-    }
-    total += 4; // overhead für role/metadata
-  }
-  return total;
-}
-
-// ============================================================================
-// Context Compression Utility
-// ============================================================================
-
-/**
- * Komprimiert Context durch Entfernung ältester Einträge
- * Bewahrt immer den ersten Eintrag (System Prompt)
- */
-function compressContext(historyArray, maxTokens) {
-  if (!Array.isArray(historyArray) || historyArray.length === 0) {
-    return historyArray;
-  }
-
-  let currentTokens = estimateContextTokens(historyArray);
-  
-  if (currentTokens <= maxTokens) {
-    return historyArray;
-  }
-
-  const compressed = [...historyArray];
-  const systemPrompt = compressed[0];
-  
-  while (compressed.length > 1 && estimateContextTokens(compressed) > maxTokens) {
-    const removed = compressed.splice(1, 1)[0];
-    console.log(`[ContextCompression] Removed entry: ${removed.role || 'unknown'} (${estimateTokens(removed.content || '')} tokens)`);
-  }
-
-  console.log(`[ContextCompression] Compressed from ${currentTokens} to ${estimateContextTokens(compressed)} tokens (${historyArray.length} → ${compressed.length} entries)`);
-  
-  return compressed;
-}
-
-// ============================================================================
-// ReAct Orchestrator - Vollständig Asynchron mit Retry & Sliding Window
-// ============================================================================
-
-class ReActOrchestrator {
-  constructor(config = {}) {
-    this.llmCommand = config.llmCommand || process.env.LLM_COMMAND || 'gemini-code';
-    this.llmArgs = config.llmArgs || [];
-    this.guardrails = new Guardrails(config.guardrails);
-    
-    // Context Window Management
-    this.maxContextTokens = config.maxTokens || 4000;
-    this.tokenReserve = config.tokenReserve || 500;
-    this.effectiveMaxTokens = this.maxContextTokens - this.tokenReserve;
-    
-    // Sliding Window für History (max 10 Einträge)
-    this.maxHistoryEntries = config.maxHistoryEntries || 10;
-    this.contextHistory = [];
-    this.systemPrompt = null;
-    
-    // Retry Konfiguration
-    this.maxRetries = config.maxRetries || 3;
-    this.baseDelay = config.baseDelay || 1000;
-    
-    this.activeProcess = null;
-    this.iteration = 0;
-  }
-
-  /**
-   * Haupt-Loop mit asynchroner, nicht-blockierender Ausführung
-   */
-  async runLoop(userInput) {
-    this.iteration = 0;
-    let isComplete = false;
-    
-    // Initialisiere Context mit System Prompt
-    await this._initializeContext(userInput);
-
-    while (!isComplete && this.iteration < this.guardrails.maxIterations) {
-      this.iteration++;
-      console.log(`\n[Iteration ${this.iteration}/${this.guardrails.maxIterations}]`);
-      console.log(`[Context] ${estimateContextTokens(this.contextHistory)}/${this.maxContextTokens} tokens, ${this.contextHistory.length} entries`);
-      
-      // Context vor LLM-Call komprimieren
-      this._compressContext();
-      
-      // LLM Call mit Retry
-      let llmOutput;
-      try {
-        llmOutput = await this._executeWithRetry(
-          () => this.spawnLLM(userInput),
-          this.maxRetries
-        );
-      } catch (error) {
-        console.error(`[Orchestrator] LLM call failed after retries: ${error.message}`);
-        break;
-      }
-      
-      // Füge LLM Output zur History hinzu (mit Sliding Window)
-      this._addToHistory('assistant', llmOutput);
-      
-      if (llmOutput.includes('<TASK_COMPLETE>')) {
-        isComplete = true;
-        console.log('\n✓ Task completed');
-        break;
-      }
-
-      // Parse Actions
-      const actions = this.parseActions(llmOutput);
-      
-      if (actions.length === 0) {
-        console.log('\n' + llmOutput.replace(/<[^>]+>/g, '').trim());
-        break;
-      }
-
-      // Führe Actions asynchron aus
-      const observations = [];
-      for (const action of actions) {
-        try {
-          const result = await this._executeWithRetry(
-            () => this.executeAction(action),
-            this.maxRetries
-          );
-          observations.push({ action, result });
-        } catch (error) {
-          observations.push({ 
-            action, 
-            result: { success: false, output: error.message } 
-          });
-        }
-      }
-
-      // Baue Observation Prompt
-      const observationPrompt = this.buildObservationPrompt(llmOutput, observations);
-      
-      // Füge Observation zur History hinzu (mit Sliding Window)
-      this._addToHistory('user', observationPrompt);
-    }
-
-    if (this.iteration >= this.guardrails.maxIterations) {
-      console.log('\n⚠ Max iterations reached');
-    }
-    
-    console.log(`\n[Final Context] ${estimateContextTokens(this.contextHistory)}/${this.maxContextTokens} tokens, ${this.contextHistory.length} entries`);
-  }
-
-  /**
-   * Initialisiert den Context mit System Prompt
-   */
-  async _initializeContext(userInput) {
-    this.systemPrompt = {
-      role: 'system',
-      content: `You are an autonomous agent. Use these actions:
-<EXECUTE_CMD>command</EXECUTE_CMD> - Execute shell command
-<WRITE_FILE>path</WRITE_FILE><CONTENT>content</CONTENT> - Write file
-<READ_FILE>path</READ_FILE> - Read file
-<TASK_COMPLETE> - When done
-
-Task: ${userInput}
-
-Think step by step. Use actions to accomplish the task. Always end with <TASK_COMPLETE>.`
+export class GlobalState {
+  constructor(sessionId, initialData = {}) {
+    this.sessionId = sessionId;
+    this.data = {
+      iteration: 0,
+      maxIterations: 50,
+      visitedNodes: [],
+      nodeResults: {},
+      context: {},
+      memory: [],
+      errors: [],
+      checkpointCount: 0,
+      ...initialData
     };
-    
-    this.contextHistory = [this.systemPrompt];
-    
-    // Füge initialen Task als User Message hinzu
-    this._addToHistory('user', `Task: ${userInput}`);
+    this.locks = new Map();
+    this.logger = new Logger({ context: { sessionId } });
   }
 
   /**
-   * Fügt Eintrag zur History hinzu mit Sliding Window (max 10 Einträge)
+   * Atomically update state
    */
-  _addToHistory(role, content) {
-    this.contextHistory.push({ role, content });
-    
-    // Sliding Window: Behalte nur die letzten maxHistoryEntries
-    if (this.contextHistory.length > this.maxHistoryEntries) {
-      // Entferne ältesten Eintrag nach System Prompt (Index 1)
-      const removed = this.contextHistory.splice(1, 1)[0];
-      console.log(`[SlidingWindow] Removed oldest entry: ${removed.role} (${estimateTokens(removed.content)} tokens)`);
+  async update(updates) {
+    const lockKey = 'state';
+    while (this.locks.get(lockKey)) {
+      await sleep(10);
     }
     
-    // Sofort komprimieren wenn über Token-Limit
-    const currentTokens = estimateContextTokens(this.contextHistory);
-    if (currentTokens > this.effectiveMaxTokens) {
-      console.log(`[Context] Token limit approaching (${currentTokens}/${this.effectiveMaxTokens}), compressing...`);
-      this._compressContext();
+    this.locks.set(lockKey, true);
+    try {
+      this.data = {
+        ...this.data,
+        ...updates,
+        lastUpdated: Date.now()
+      };
+      return { ...this.data };
+    } finally {
+      this.locks.delete(lockKey);
     }
   }
 
   /**
-   * Komprimiert Context vor LLM-Call
+   * Get current state snapshot
    */
-  _compressContext() {
-    const beforeTokens = estimateContextTokens(this.contextHistory);
-    const beforeCount = this.contextHistory.length;
-    
-    this.contextHistory = compressContext(
-      this.contextHistory, 
-      this.effectiveMaxTokens
-    );
-    
-    const afterTokens = estimateContextTokens(this.contextHistory);
-    
-    if (beforeCount !== this.contextHistory.length) {
-      console.log(`[ContextCompression] ${beforeCount} → ${this.contextHistory.length} entries, ${beforeTokens} → ${afterTokens} tokens`);
+  get() {
+    return { ...this.data };
+  }
+
+  /**
+   * Record node execution
+   */
+  recordNodeVisit(nodeId, result) {
+    this.data.visitedNodes.push({
+      nodeId,
+      timestamp: Date.now(),
+      iteration: this.data.iteration
+    });
+    this.data.nodeResults[nodeId] = result;
+  }
+
+  /**
+   * Detect cycles in execution path
+   */
+  detectCycle(nodeId, maxRevisits = 3) {
+    const visits = this.data.visitedNodes.filter(v => v.nodeId === nodeId);
+    return visits.length >= maxRevisits;
+  }
+
+  /**
+   * Check if max iterations exceeded
+   */
+  isMaxIterationsExceeded() {
+    return this.data.iteration >= this.data.maxIterations;
+  }
+
+  /**
+   * Increment iteration counter
+   */
+  incrementIteration() {
+    this.data.iteration++;
+    return this.data.iteration;
+  }
+
+  /**
+   * Add to memory
+   */
+  addMemory(entry) {
+    this.data.memory.push({
+      ...entry,
+      timestamp: Date.now()
+    });
+    // Keep only last 100 entries
+    if (this.data.memory.length > 100) {
+      this.data.memory = this.data.memory.slice(-100);
     }
   }
 
   /**
-   * Gibt optimierte History für LLM-Call zurück (max 10 Einträge, formatiert)
+   * Record error
    */
-  _getOptimizedHistory() {
-    // Sicherstellen dass Context komprimiert ist
-    this._compressContext();
-    
-    // Sliding Window: Max 10 Einträge
-    let optimized = this.contextHistory;
-    if (optimized.length > this.maxHistoryEntries) {
-      const systemPrompt = optimized[0];
-      const recent = optimized.slice(-(this.maxHistoryEntries - 1));
-      optimized = [systemPrompt, ...recent];
-    }
-    
-    // Formatiere für LLM
-    const formatted = [];
-    for (const entry of optimized) {
-      switch (entry.role) {
-        case 'system':
-          formatted.push({
-            role: 'system',
-            content: entry.content
-          });
-          break;
-        case 'user':
-          formatted.push({
-            role: 'user',
-            content: entry.content.substring(0, 2000) // Limit content length
-          });
-          break;
-        case 'assistant':
-          formatted.push({
-            role: 'assistant',
-            content: entry.content.substring(0, 3000) // Allow more for assistant
-          });
-          break;
-      }
-    }
-    
-    return formatted;
-  }
-
-  /**
-   * Führt Funktion mit Retry und Exponential Backoff aus
-   * @param {Function} fn - Die auszuführende Funktion
-   * @param {number} maxRetries - Maximale Anzahl Versuche
-   * @returns {Promise} - Ergebnis der Funktion
-   */
-  async _executeWithRetry(fn, maxRetries = 3) {
-    let lastError;
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`[Retry] Attempt ${attempt}/${maxRetries}`);
-        return await fn();
-      } catch (error) {
-        lastError = error;
-        console.warn(`[Retry] Attempt ${attempt} failed: ${error.message}`);
-        
-        if (attempt < maxRetries) {
-          // Exponential Backoff: 1s, 2s, 4s
-          const delay = this.baseDelay * Math.pow(2, attempt - 1);
-          console.log(`[Retry] Waiting ${delay}ms before retry...`);
-          await this._sleep(delay);
-        }
-      }
-    }
-    
-    throw new Error(`Failed after ${maxRetries} attempts: ${lastError.message}`);
-  }
-
-  /**
-   * Sleep Utility für Backoff
-   */
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Asynchroner LLM Call mit Context-Kompression
-   */
-  async spawnLLM(input) {
-    // Sicherstellen dass Context komprimiert ist
-    this._compressContext();
-    
-    return new Promise((resolve, reject) => {
-      const outputChunks = [];
-      const timeoutId = setTimeout(() => {
-        if (this.activeProcess) {
-          this.activeProcess.kill('SIGTERM');
-          setTimeout(() => this.activeProcess?.kill('SIGKILL'), 5000);
-        }
-        reject(new Error('LLM timeout'));
-      }, this.guardrails.timeoutMs);
-
-      this.activeProcess = spawn(this.llmCommand, this.llmArgs, {
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      this.activeProcess.stdout.on('data', (chunk) => {
-        outputChunks.push(chunk.toString());
-        process.stdout.write(chunk);
-      });
-
-      this.activeProcess.stderr.on('data', (chunk) => {
-        console.error(chunk.toString());
-      });
-
-      this.activeProcess.on('close', (code) => {
-        clearTimeout(timeoutId);
-        this.activeProcess = null;
-        resolve(outputChunks.join(''));
-      });
-
-      this.activeProcess.on('error', (err) => {
-        clearTimeout(timeoutId);
-        reject(err);
-      });
-
-      // Baue Prompt aus optimierter History
-      const prompt = this._buildPromptFromHistory();
-
-      this.activeProcess.stdin.write(prompt, 'utf8');
-      this.activeProcess.stdin.end();
+  recordError(error, nodeId = null) {
+    this.data.errors.push({
+      message: error.message,
+      stack: error.stack,
+      nodeId,
+      timestamp: Date.now()
     });
   }
+}
 
-  /**
-   * Baut den finalen Prompt aus der optimierten History
-   */
-  _buildPromptFromHistory() {
-    const optimized = this._getOptimizedHistory();
+// ============================================================================
+// Agent Node Definition
+// ============================================================================
+
+/**
+ * AgentNode - Blueprint for an agent in the graph
+ */
+export class AgentNode {
+  constructor(config) {
+    this.id = config.id;
+    this.name = config.name || config.id;
+    this.agentType = config.agentType || 'generic';
+    this.action = config.action;
+    this.inputSchema = config.inputSchema || null;
+    this.outputSchema = config.outputSchema || null;
+    this.timeout = config.timeout || 30000;
+    this.retryCount = config.retryCount || 2;
+    this.metadata = config.metadata || {};
+    this.templates = config.templates || [];
     
-    let prompt = '';
-    
-    for (const entry of optimized) {
-      switch (entry.role) {
-        case 'system':
-          prompt += entry.content + '\n\n';
-          break;
-        case 'user':
-          prompt += `User: ${entry.content}\n\n`;
-          break;
-        case 'assistant':
-          prompt += `Assistant: ${entry.content}\n\n`;
-          break;
-      }
-    }
-    
-    // Hinweis wenn Context komprimiert wurde
-    if (this.iteration > this.maxHistoryEntries / 2) {
-      prompt += '\n[Note: Earlier conversation history may have been summarized.]\n\n';
-    }
-    
-    prompt += 'Continue:';
-    
-    return prompt;
+    // Runtime tracking
+    this.executionCount = 0;
+    this.totalExecutionTime = 0;
+    this.errors = [];
   }
 
   /**
-   * Parst Actions aus LLM Output
+   * Validate input against schema
    */
-  parseActions(output) {
-    const actions = [];
+  validateInput(input) {
+    if (!this.inputSchema) return { valid: true };
     
-    const execMatch = output.match(/<EXECUTE_CMD>([\s\S]*?)<\/EXECUTE_CMD>/);
-    if (execMatch) {
-      actions.push({ type: 'EXECUTE_CMD', payload: execMatch[1].trim() });
-    }
-
-    const writeMatch = output.match(/<WRITE_FILE>([\s\S]*?)<\/WRITE_FILE>[\s\S]*?<CONTENT>([\s\S]*?)<\/CONTENT>/);
-    if (writeMatch) {
-      actions.push({ type: 'WRITE_FILE', path: writeMatch[1].trim(), content: writeMatch[2] });
-    }
-
-    const readMatch = output.match(/<READ_FILE>([\s\S]*?)<\/READ_FILE>/);
-    if (readMatch) {
-      actions.push({ type: 'READ_FILE', path: readMatch[1].trim() });
-    }
-
-    return actions;
-  }
-
-  /**
-   * Führt Action asynchron aus (NICHT-blockierend)
-   */
-  async executeAction(action) {
     try {
-      switch (action.type) {
-        case 'EXECUTE_CMD':
-          console.log(`[EXEC] ${action.payload}`);
-          // ASYNCHRON: execAsync statt execSync
-          const { stdout } = await execAsync(action.payload, { 
-            timeout: 30000,
-            maxBuffer: 1024 * 1024 // 1MB
-          });
-          return { success: true, output: stdout };
-
-        case 'WRITE_FILE':
-          console.log(`[WRITE] ${action.path}`);
-          // ASYNCHRON: fs.promises
-          await fs.mkdir(path.dirname(action.path), { recursive: true });
-          await fs.writeFile(action.path, action.content, 'utf8');
-          return { success: true, output: `Wrote ${action.path}` };
-
-        case 'READ_FILE':
-          console.log(`[READ] ${action.path}`);
-          // ASYNCHRON: fs.promises
-          try {
-            const content = await fs.readFile(action.path, 'utf8');
-            return { success: true, output: content };
-          } catch (err) {
-            if (err.code === 'ENOENT') {
-              return { success: false, output: `File not found: ${action.path}` };
-            }
-            throw err;
-          }
-
-        default:
-          return { success: false, output: 'Unknown action' };
+      const result = this.inputSchema.safeParse(input);
+      if (result.success) {
+        return { valid: true, data: result.data };
       }
-    } catch (err) {
-      return { success: false, output: err.message };
+      return {
+        valid: false,
+        errors: result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`)
+      };
+    } catch (error) {
+      return { valid: false, errors: [error.message] };
     }
   }
 
   /**
-   * Baut Observation Prompt
+   * Validate output against schema
    */
-  buildObservationPrompt(previousOutput, observations) {
-    let prompt = 'Previous actions:\n';
-    for (const obs of observations) {
-      prompt += `\nAction: ${obs.action.type}\n`;
-      prompt += `Result: ${obs.result.success ? 'SUCCESS' : 'FAILED'}\n`;
-      // Limit output length
-      const output = obs.result.output.substring(0, 1000);
-      prompt += `Output: ${output}${obs.result.output.length > 1000 ? '...' : ''}\n`;
+  validateOutput(output) {
+    if (!this.outputSchema) return { valid: true };
+    
+    try {
+      const result = this.outputSchema.safeParse(output);
+      if (result.success) {
+        return { valid: true, data: result.data };
+      }
+      return {
+        valid: false,
+        errors: result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`)
+      };
+    } catch (error) {
+      return { valid: false, errors: [error.message] };
     }
-    prompt += '\nContinue the task. Use actions or mark complete.';
-    return prompt;
   }
 
   /**
-   * Gibt Context-Status zurück
+   * Execute node action
    */
-  getContextStatus() {
+  async execute(input, globalState, context = {}) {
+    const startTime = Date.now();
+    this.executionCount++;
+    
+    // Validate input
+    const inputValidation = this.validateInput(input);
+    if (!inputValidation.valid) {
+      throw new Error(`Input validation failed: ${inputValidation.errors.join(', ')}`);
+    }
+
+    // Execute with retry
+    let lastError;
+    for (let attempt = 1; attempt <= this.retryCount; attempt++) {
+      try {
+        const result = await this._executeWithTimeout(
+          this.action,
+          inputValidation.data || input,
+          globalState,
+          context,
+          this.timeout
+        );
+
+        // Validate output
+        const outputValidation = this.validateOutput(result);
+        if (!outputValidation.valid) {
+          throw new Error(`Output validation failed: ${outputValidation.errors.join(', ')}`);
+        }
+
+        const executionTime = Date.now() - startTime;
+        this.totalExecutionTime += executionTime;
+
+        return {
+          success: true,
+          result: outputValidation.data || result,
+          executionTime,
+          attempt,
+          nodeId: this.id
+        };
+
+      } catch (error) {
+        lastError = error;
+        if (attempt < this.retryCount) {
+          await sleep(1000 * attempt); // Exponential backoff
+        }
+      }
+    }
+
+    this.errors.push({
+      message: lastError.message,
+      timestamp: Date.now(),
+      input: JSON.stringify(input).slice(0, 500)
+    });
+
+    throw lastError;
+  }
+
+  async _executeWithTimeout(action, input, globalState, context, timeout) {
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        reject(new Error(`Node execution timeout after ${timeout}ms`));
+      }, timeout);
+
+      Promise.resolve(action(input, globalState, context))
+        .then(result => {
+          clearTimeout(timeoutId);
+          resolve(result);
+        })
+        .catch(error => {
+          clearTimeout(timeoutId);
+          reject(error);
+        });
+    });
+  }
+}
+
+// ============================================================================
+// Graph Edge Definition
+// ============================================================================
+
+/**
+ * GraphEdge - Connection between nodes with conditional routing
+ */
+export class GraphEdge {
+  constructor(fromNode, toNode, condition = null, metadata = {}) {
+    this.id = `${fromNode}->${toNode}`;
+    this.fromNode = fromNode;
+    this.toNode = toNode;
+    this.condition = condition; // Function: (result, globalState) => boolean
+    this.metadata = metadata;
+    this.executionCount = 0;
+  }
+
+  /**
+   * Check if edge should be traversed
+   */
+  shouldTraverse(result, globalState) {
+    if (!this.condition) return true;
+    
+    try {
+      return this.condition(result, globalState);
+    } catch (error) {
+      console.error(`[GraphEdge] Condition evaluation failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Record edge traversal
+   */
+  recordTraversal() {
+    this.executionCount++;
+  }
+}
+
+// ============================================================================
+// Agent Graph
+// ============================================================================
+
+/**
+ * AgentGraph - LangGraph-inspired stateful graph orchestrator
+ */
+export class AgentGraph {
+  constructor(config = {}) {
+    this.id = config.id || `graph_${Date.now()}`;
+    this.name = config.name || 'AgentGraph';
+    this.nodes = new Map();
+    this.edges = new Map();
+    this.entryPoint = null;
+    this.endNodes = new Set();
+    
+    // State management
+    this.globalState = null;
+    this.statePersistence = new StatePersistence({
+      stateDir: config.stateDir || './session_state'
+    });
+    
+    // Logging
+    this.logger = new Logger({
+      context: { graphId: this.id },
+      level: config.logLevel || 'info'
+    });
+    
+    // Checkpointing
+    this.checkpointInterval = config.checkpointInterval || 5;
+    this.checkpointEnabled = config.checkpointEnabled !== false;
+    
+    // Execution tracking
+    this.executionHistory = [];
+    this.isRunning = false;
+  }
+
+  /**
+   * Add a node to the graph
+   */
+  addNode(agentId, action, config = {}) {
+    const node = new AgentNode({
+      id: agentId,
+      name: config.name || agentId,
+      agentType: config.agentType || 'generic',
+      action,
+      inputSchema: config.inputSchema,
+      outputSchema: config.outputSchema,
+      timeout: config.timeout || 30000,
+      retryCount: config.retryCount || 2,
+      metadata: config.metadata || {},
+      templates: config.templates || []
+    });
+
+    this.nodes.set(agentId, node);
+    this.logger.info(`Node added: ${agentId}`, { nodeId: agentId, type: config.agentType });
+    
+    return this;
+  }
+
+  /**
+   * Add an edge between nodes
+   */
+  addEdge(fromNodeId, toNodeId, condition = null, metadata = {}) {
+    if (!this.nodes.has(fromNodeId)) {
+      throw new Error(`Source node not found: ${fromNodeId}`);
+    }
+    if (!this.nodes.has(toNodeId)) {
+      throw new Error(`Target node not found: ${toNodeId}`);
+    }
+
+    const edge = new GraphEdge(fromNodeId, toNodeId, condition, metadata);
+    this.edges.set(edge.id, edge);
+    
+    this.logger.info(`Edge added: ${fromNodeId} -> ${toNodeId}`, {
+      from: fromNodeId,
+      to: toNodeId,
+      conditional: !!condition
+    });
+    
+    return this;
+  }
+
+  /**
+   * Set the entry point for graph execution
+   */
+  setEntryPoint(nodeId) {
+    if (!this.nodes.has(nodeId)) {
+      throw new Error(`Entry point node not found: ${nodeId}`);
+    }
+    this.entryPoint = nodeId;
+    this.logger.info(`Entry point set: ${nodeId}`);
+    return this;
+  }
+
+  /**
+   * Mark a node as an end node
+   */
+  addEndNode(nodeId) {
+    if (!this.nodes.has(nodeId)) {
+      throw new Error(`End node not found: ${nodeId}`);
+    }
+    this.endNodes.add(nodeId);
+    this.logger.info(`End node added: ${nodeId}`);
+    return this;
+  }
+
+  /**
+   * Initialize global state
+   */
+  initializeState(initialData = {}, sessionId = null) {
+    const sid = sessionId || crypto.randomUUID();
+    this.globalState = new GlobalState(sid, initialData);
+    
+    // Initialize session persistence
+    this.statePersistence.initSession(
+      `Graph execution: ${this.name}`,
+      'graph-orchestration'
+    );
+    
+    this.logger.info('Global state initialized', { sessionId: sid });
+    return sid;
+  }
+
+  /**
+   * Get outgoing edges from a node
+   */
+  getOutgoingEdges(nodeId) {
+    const edges = [];
+    for (const edge of this.edges.values()) {
+      if (edge.fromNode === nodeId) {
+        edges.push(edge);
+      }
+    }
+    return edges;
+  }
+
+  /**
+   * Get next nodes based on execution result
+   */
+  getNextNodes(currentNodeId, result) {
+    const outgoingEdges = this.getOutgoingEdges(currentNodeId);
+    const nextNodes = [];
+
+    for (const edge of outgoingEdges) {
+      if (edge.shouldTraverse(result, this.globalState)) {
+        nextNodes.push({
+          nodeId: edge.toNode,
+          edge: edge
+        });
+      }
+    }
+
+    return nextNodes;
+  }
+
+  /**
+   * Main graph execution - iterative with cycle detection
+   */
+  async execute(initialInput = {}, options = {}) {
+    if (!this.entryPoint) {
+      throw new Error('No entry point set. Call setEntryPoint() first.');
+    }
+
+    if (!this.globalState) {
+      this.initializeState();
+    }
+
+    this.isRunning = true;
+    const startTime = Date.now();
+    
+    this.logger.info('Graph execution started', {
+      graphId: this.id,
+      entryPoint: this.entryPoint,
+      sessionId: this.globalState.sessionId
+    });
+
+    // Initialize execution queue with entry point
+    const queue = [{
+      nodeId: this.entryPoint,
+      input: initialInput,
+      parentNode: null
+    }];
+
+    const results = [];
+
+    try {
+      while (queue.length > 0 && this.isRunning) {
+        // Check max iterations
+        const iteration = this.globalState.incrementIteration();
+        
+        if (this.globalState.isMaxIterationsExceeded()) {
+          this.logger.error('Max iterations exceeded', { iteration });
+          throw new Error(`Max iterations (${this.globalState.data.maxIterations}) exceeded`);
+        }
+
+        // Checkpoint if needed
+        if (this.checkpointEnabled && iteration % this.checkpointInterval === 0) {
+          await this._createCheckpoint(`iteration_${iteration}`);
+        }
+
+        // Process next node in queue
+        const { nodeId, input, parentNode } = queue.shift();
+        
+        // Check for cycles
+        if (this.globalState.detectCycle(nodeId, 3)) {
+          this.logger.warn(`Cycle detected for node ${nodeId}, skipping`, { nodeId, iteration });
+          this.globalState.recordError(new Error(`Cycle detected: ${nodeId}`), nodeId);
+          continue;
+        }
+
+        // Execute node
+        const node = this.nodes.get(nodeId);
+        if (!node) {
+          throw new Error(`Node not found: ${nodeId}`);
+        }
+
+        this.logger.info(`Executing node: ${nodeId}`, {
+          nodeId,
+          iteration,
+          parentNode
+        });
+
+        let nodeResult;
+        try {
+          nodeResult = await node.execute(input, this.globalState, {
+            graphId: this.id,
+            iteration,
+            parentNode
+          });
+
+          this.globalState.recordNodeVisit(nodeId, nodeResult);
+          results.push(nodeResult);
+
+          this.logger.info(`Node completed: ${nodeId}`, {
+            nodeId,
+            executionTime: nodeResult.executionTime,
+            success: nodeResult.success
+          });
+
+        } catch (error) {
+          this.logger.error(`Node execution failed: ${nodeId}`, {
+            nodeId,
+            error: error.message
+          });
+          
+          this.globalState.recordError(error, nodeId);
+          
+          // Try to find error handling edge
+          const errorEdges = this.getOutgoingEdges(nodeId).filter(e => 
+            e.metadata?.errorHandler === true
+          );
+          
+          if (errorEdges.length > 0) {
+            for (const edge of errorEdges) {
+              queue.push({
+                nodeId: edge.toNode,
+                input: { error: error.message, parentResult: null },
+                parentNode: nodeId
+              });
+            }
+            continue;
+          }
+          
+          throw error;
+        }
+
+        // Check if end node
+        if (this.endNodes.has(nodeId)) {
+          this.logger.info(`End node reached: ${nodeId}`);
+          break;
+        }
+
+        // Get next nodes
+        const nextNodes = this.getNextNodes(nodeId, nodeResult);
+        
+        for (const { nodeId: nextNodeId, edge } of nextNodes) {
+          edge.recordTraversal();
+          queue.push({
+            nodeId: nextNodeId,
+            input: nodeResult.result,
+            parentNode: nodeId
+          });
+        }
+
+        // Log graph state
+        this.executionHistory.push({
+          iteration,
+          nodeId,
+          timestamp: Date.now(),
+          queueLength: queue.length
+        });
+      }
+
+      const totalTime = Date.now() - startTime;
+      
+      this.logger.info('Graph execution completed', {
+        graphId: this.id,
+        iterations: this.globalState.data.iteration,
+        totalTime,
+        nodesExecuted: results.length
+      });
+
+      return {
+        success: true,
+        results,
+        finalState: this.globalState.get(),
+        executionTime: totalTime,
+        iterations: this.globalState.data.iteration
+      };
+
+    } catch (error) {
+      this.logger.error('Graph execution failed', {
+        error: error.message,
+        iteration: this.globalState.data.iteration
+      });
+
+      // Create error checkpoint
+      if (this.checkpointEnabled) {
+        await this._createCheckpoint('error');
+      }
+
+      throw error;
+    } finally {
+      this.isRunning = false;
+    }
+  }
+
+  /**
+   * Execute graph asynchronously (non-blocking)
+   */
+  async executeAsync(initialInput = {}, options = {}) {
+    return this.execute(initialInput, options);
+  }
+
+  /**
+   * Stop graph execution
+   */
+  stop() {
+    this.isRunning = false;
+    this.logger.info('Graph execution stopped');
+  }
+
+  /**
+   * Create checkpoint
+   */
+  async _createCheckpoint(reason) {
+    try {
+      const checkpointId = this.statePersistence.createCheckpoint(reason);
+      this.globalState.data.checkpointCount++;
+      
+      this.logger.debug(`Checkpoint created: ${checkpointId}`, { reason });
+      
+      return checkpointId;
+    } catch (error) {
+      this.logger.error('Checkpoint creation failed', { error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Restore from checkpoint
+   */
+  async restoreCheckpoint(checkpointId) {
+    try {
+      const state = this.statePersistence.restoreCheckpoint(checkpointId);
+      this.globalState = new GlobalState(state.metadata.session_id, state);
+      
+      this.logger.info(`Restored from checkpoint: ${checkpointId}`);
+      
+      return this.globalState;
+    } catch (error) {
+      this.logger.error('Checkpoint restore failed', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Get graph status
+   */
+  getStatus() {
     return {
-      tokens: estimateContextTokens(this.contextHistory),
-      maxTokens: this.maxContextTokens,
-      effectiveMaxTokens: this.effectiveMaxTokens,
-      entries: this.contextHistory.length,
-      maxHistoryEntries: this.maxHistoryEntries,
-      utilization: (estimateContextTokens(this.contextHistory) / this.maxContextTokens * 100).toFixed(1) + '%',
-      iterations: this.iteration
+      id: this.id,
+      name: this.name,
+      nodeCount: this.nodes.size,
+      edgeCount: this.edges.size,
+      entryPoint: this.entryPoint,
+      endNodes: Array.from(this.endNodes),
+      isRunning: this.isRunning,
+      globalState: this.globalState?.get() || null,
+      executionHistory: this.executionHistory.slice(-20)
     };
   }
 
   /**
-   * Manuelle Context-Kompression
+   * Export graph definition
    */
-  forceCompress() {
-    this._compressContext();
-    return this.getContextStatus();
+  exportGraph() {
+    const nodes = [];
+    for (const [id, node] of this.nodes) {
+      nodes.push({
+        id: node.id,
+        name: node.name,
+        agentType: node.agentType,
+        hasInputSchema: !!node.inputSchema,
+        hasOutputSchema: !!node.outputSchema,
+        metadata: node.metadata
+      });
+    }
+
+    const edges = [];
+    for (const [id, edge] of this.edges) {
+      edges.push({
+        id: edge.id,
+        from: edge.fromNode,
+        to: edge.toNode,
+        conditional: !!edge.condition,
+        metadata: edge.metadata,
+        executionCount: edge.executionCount
+      });
+    }
+
+    return {
+      id: this.id,
+      name: this.name,
+      nodes,
+      edges,
+      entryPoint: this.entryPoint,
+      endNodes: Array.from(this.endNodes)
+    };
+  }
+
+  /**
+   * Visualize graph (Mermaid format)
+   */
+  visualize() {
+    let mermaid = 'graph TD\n';
+    
+    // Add nodes
+    for (const [id, node] of this.nodes) {
+      const shape = this.endNodes.has(id) ? '((END))' : 
+                    id === this.entryPoint ? '[[ENTRY]]' : '[NODE]';
+      mermaid += `  ${id}${shape}\n`;
+    }
+    
+    // Add edges
+    for (const edge of this.edges.values()) {
+      const label = edge.condition ? '|conditional|' : '';
+      mermaid += `  ${edge.fromNode} -->${label} ${edge.toNode}\n`;
+    }
+    
+    return mermaid;
   }
 }
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Create a conditional edge function
+ */
+export function createCondition(predicate) {
+  return (result, globalState) => {
+    try {
+      return predicate(result, globalState);
+    } catch (error) {
+      console.error(`[Condition] Evaluation error: ${error.message}`);
+      return false;
+    }
+  };
+}
+
+/**
+ * Common conditions
+ */
+export const Conditions = {
+  always: () => true,
+  never: () => false,
+  
+  success: (result) => result?.success === true,
+  failure: (result) => result?.success === false,
+  
+  confidenceAbove: (threshold) => (result) => 
+    result?.result?.confidence >= threshold,
+  
+  confidenceBelow: (threshold) => (result) => 
+    result?.result?.confidence < threshold,
+  
+  iterationBelow: (maxIter) => (result, globalState) => 
+    globalState.data.iteration < maxIter,
+  
+  hasResult: (result) => result?.result != null,
+  
+  matchesPattern: (pattern) => (result) => {
+    const str = JSON.stringify(result);
+    return pattern.test(str);
+  }
+};
 
 // ============================================================================
 // Exports
 // ============================================================================
 
-module.exports = { 
-  ReActOrchestrator,
-  estimateTokens,
-  estimateContextTokens,
-  compressContext
-};
+export { GlobalState, AgentNode, GraphEdge };
+export default AgentGraph;

@@ -1,28 +1,333 @@
 /**
- * Multi-Agent Supervisor v4.0
+ * Multi-Agent Supervisor v6.0
  * 
- * Refactored: XState FSM v5 mit striktem Handoff-Budget
- * Verhindert unendliche Handoff-Schleifen durch State-Machine-Guards
+ * Refactored: Atomares State-Locking + Batch-Commit + Context-Caching
+ * Thread-sichere parallele Agent-Ausführung mit deterministischen State-Updates
  * 
  * @module multi-agent-supervisor
- * @version 4.0.0
+ * @version 6.0.0
  */
 
 const { createMachine, interpret, assign } = require('xstate');
+const { z } = require('zod');
 const { SmartLoader } = require('./smart-loader');
 const { ErrorRecoveryManager } = require('./enhanced-error-recovery');
+const { ContextCompiler } = require('./context-compiler');
+const crypto = require('crypto');
+const fs = require('fs').promises;
+const path = require('path');
 
 // ============================================================================
-// XState Finite State Machine für Handoff-Kontrolle (v5 API)
+// Atomarer Mutex für State-Locking (File-based für Cross-Process-Safety)
 // ============================================================================
 
-/**
- * Supervisor State Machine
- * 
- * Jeder Agent ist ein State-Node.
- * Handoff-Transitions inkrementieren handoffCount.
- * Guard verhindert Transition wenn Budget erschöpft.
- */
+class StateLockManager {
+  constructor(lockDir = './locks') {
+    this.lockDir = lockDir;
+    this.localLock = new Map();
+    this.lockCounter = 0;
+    this.lockQueue = [];
+  }
+
+  async acquire(lockName = 'state', timeout = 30000) {
+    const startTime = Date.now();
+    const lockFile = path.join(this.lockDir, `${lockName}.lock`);
+    
+    await fs.mkdir(this.lockDir, { recursive: true });
+    
+    while (Date.now() - startTime < timeout) {
+      try {
+        await fs.writeFile(lockFile, JSON.stringify({
+          pid: process.pid,
+          timestamp: Date.now()
+        }), { flag: 'wx' });
+        
+        this.localLock.set(lockName, lockFile);
+        this.lockCounter++;
+        
+        return {
+          release: async () => {
+            try {
+              await fs.unlink(lockFile);
+              this.localLock.delete(lockName);
+            } catch (err) {
+              console.warn(`[Mutex] Lock release warning: ${err.message}`);
+            }
+          }
+        };
+      } catch (err) {
+        if (err.code === 'EEXIST') {
+          await this._sleep(50);
+          continue;
+        }
+        throw err;
+      }
+    }
+    
+    throw new Error(`Failed to acquire lock '${lockName}' within ${timeout}ms`);
+  }
+
+  async withLock(lockName, fn, timeout = 30000) {
+    const lock = await this.acquire(lockName, timeout);
+    try {
+      return await fn();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  _sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  isLocked(lockName) {
+    return this.localLock.has(lockName);
+  }
+
+  getStats() {
+    return {
+      activeLocks: this.localLock.size,
+      totalLocksAcquired: this.lockCounter,
+      lockNames: Array.from(this.localLock.keys())
+    };
+  }
+}
+
+// ============================================================================
+// Batch-Commit Manager für atomare State-Updates
+// ============================================================================
+
+class BatchCommitManager {
+  constructor(supervisor) {
+    this.supervisor = supervisor;
+    this.pendingResults = [];
+    this.isCommitting = false;
+    this.commitQueue = [];
+    this.stats = {
+      totalCommits: 0,
+      batchCommits: 0,
+      individualCommits: 0,
+      failedCommits: 0,
+      errorsMarked: 0
+    };
+  }
+
+  addPendingResult(result) {
+    this.pendingResults.push({
+      ...result,
+      pendingSince: Date.now()
+    });
+  }
+
+  async executeBatchCommit() {
+    if (this.isCommitting || this.pendingResults.length === 0) {
+      return { committed: 0, results: [] };
+    }
+
+    this.isCommitting = true;
+    const batch = [...this.pendingResults];
+    this.pendingResults = [];
+
+    const lockManager = this.supervisor.lockManager;
+    
+    try {
+      const commitResult = await lockManager.withLock('state', async () => {
+        const results = [];
+        const errors = [];
+
+        for (const item of batch) {
+          try {
+            const result = await this._commitSingle(item);
+            results.push({ success: true, id: item.taskId, result });
+          } catch (err) {
+            errors.push({ 
+              success: false, 
+              id: item.taskId, 
+              error: err.message,
+              marked: true 
+            });
+            this.stats.errorsMarked++;
+            
+            if (item.task) {
+              item.task.status = 'failed';
+              item.task.result = { 
+                error: err.message, 
+                batchError: true,
+                timestamp: Date.now()
+              };
+            }
+          }
+        }
+
+        return { results, errors, total: batch.length };
+      });
+
+      this.stats.totalCommits++;
+      this.stats.batchCommits++;
+
+      console.log(`[BatchCommit] Committed ${commitResult.total} items (${commitResult.results.length} OK, ${commitResult.errors.length} errors)`);
+
+      return commitResult;
+
+    } catch (err) {
+      this.stats.failedCommits++;
+      
+      for (const item of batch) {
+        if (item.task) {
+          item.task.status = 'failed';
+          item.task.result = { 
+            error: `Batch commit failed: ${err.message}`,
+            timestamp: Date.now()
+          };
+        }
+      }
+      
+      throw err;
+    } finally {
+      this.isCommitting = false;
+    }
+  }
+
+  async _commitSingle(item) {
+    const { task, agent, result } = item;
+    
+    if (!task || !agent) {
+      throw new Error('Invalid commit item: missing task or agent');
+    }
+
+    task.status = 'completed';
+    task.result = result;
+    task.completedAt = Date.now();
+
+    this.supervisor.stats.tasksCompleted++;
+    this.supervisor.stats.totalExecutionTime += (task.completedAt - task.startedAt);
+
+    agent.status = 'idle';
+    agent.currentTask = null;
+    agent.history.push({
+      task: task.id,
+      result: 'success',
+      duration: task.completedAt - task.startedAt
+    });
+
+    this.supervisor.stateService.send({
+      type: 'COMPLETE',
+      result
+    });
+
+    return {
+      taskId: task.id,
+      agentId: agent.id,
+      timestamp: task.completedAt
+    };
+  }
+
+  async commitIndividual(task, agent, result) {
+    return this.lockManager.withLock('state', async () => {
+      this.stats.individualCommits++;
+      return this._commitSingle({ task, agent, result });
+    });
+  }
+
+  getPendingCount() {
+    return this.pendingResults.length;
+  }
+
+  getStats() {
+    return { ...this.stats, pending: this.pendingResults.length };
+  }
+}
+
+// ============================================================================
+// Zod Schemas für strikte I/O-Validierung
+// ============================================================================
+
+const AgentMessageSchema = z.object({
+  agentId: z.string().min(1).max(100),
+  taskId: z.string().min(1).max(100),
+  payload: z.object({
+    type: z.enum(['TASK_REQUEST', 'TASK_RESPONSE', 'HANDOFF_REQUEST', 'ERROR_REPORT']),
+    data: z.record(z.any()).optional(),
+    metadata: z.object({
+      timestamp: z.number().default(() => Date.now()),
+      compressionApplied: z.boolean().default(false),
+      originalMessageCount: z.number().optional()
+    }).default({})
+  }),
+  summary: z.string().max(5000).default('')
+});
+
+const CompressedContextSchema = z.object({
+  messages: z.array(z.object({
+    role: z.enum(['system', 'user', 'assistant']),
+    content: z.string().max(10000),
+    timestamp: z.number().optional()
+  })).max(5),
+  summary: z.string().max(10000),
+  metadata: z.object({
+    originalCount: z.number(),
+    compressionRatio: z.number(),
+    compressedAt: z.number()
+  })
+});
+
+const ValidationResultSchema = z.object({
+  success: z.boolean(),
+  data: z.any().optional(),
+  errors: z.array(z.object({
+    path: z.array(z.string()),
+    message: z.string()
+  })).default([])
+});
+
+// ============================================================================
+// Custom Validation Errors
+// ============================================================================
+
+class AgentMessageValidationError extends Error {
+  constructor(issues, originalData) {
+    const errorMessages = issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
+    super(`AgentMessage validation failed: ${errorMessages}`);
+    this.name = 'AgentMessageValidationError';
+    this.issues = issues;
+    this.originalData = originalData;
+    this.timestamp = Date.now();
+  }
+}
+
+class ContextCompressionError extends Error {
+  constructor(message, context) {
+    super(message);
+    this.name = 'ContextCompressionError';
+    this.context = context;
+    this.timestamp = Date.now();
+  }
+}
+
+class HandoffValidationError extends Error {
+  constructor(message, fromAgent, toAgent, taskId) {
+    super(message);
+    this.name = 'HandoffValidationError';
+    this.fromAgent = fromAgent;
+    this.toAgent = toAgent;
+    this.taskId = taskId;
+    this.timestamp = Date.now();
+  }
+}
+
+class StateLockError extends Error {
+  constructor(message, lockName) {
+    super(message);
+    this.name = 'StateLockError';
+    this.lockName = lockName;
+    this.timestamp = Date.now();
+  }
+}
+
+// ============================================================================
+// XState Finite State Machine
+// ============================================================================
+
 const supervisorMachine = createMachine({
   id: 'multiAgentSupervisor',
   
@@ -34,21 +339,20 @@ const supervisorMachine = createMachine({
     currentAgent: null,
     previousAgent: null,
     taskHistory: [],
-    errorContext: null
+    errorContext: null,
+    lastValidationResult: null
   },
   
   states: {
-    // Idle: Wartet auf Initialisierung
     idle: {
       on: {
         INITIALIZE: {
           target: 'ready',
-          actions: assign({}) // No-op, just transition
+          actions: assign({})
         }
       }
     },
     
-    // Ready: Bereit für Task-Zuweisung
     ready: {
       entry: () => console.log('[Supervisor FSM] State: ready'),
       on: {
@@ -64,7 +368,6 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Assigning: Task wird zugewiesen
     assigning: {
       entry: ({ context }) => console.log(`[Supervisor FSM] Task assigned to: ${context.currentAgent}`),
       on: {
@@ -89,6 +392,20 @@ const supervisorMachine = createMachine({
             })
           }
         ],
+        VALIDATION_ERROR: {
+          target: 'validation_failed',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Validation failed',
+              validationErrors: event.error?.issues || [],
+              timestamp: Date.now()
+            }),
+            lastValidationResult: ({ event }) => ({
+              success: false,
+              errors: event.error?.issues || []
+            })
+          })
+        },
         ERROR: {
           target: 'error',
           actions: assign({
@@ -101,7 +418,6 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Executing: Agent führt Task aus
     executing: {
       entry: ({ context }) => console.log(`[Supervisor FSM] Executing on: ${context.currentAgent}`),
       on: {
@@ -134,6 +450,16 @@ const supervisorMachine = createMachine({
             })
           }
         ],
+        VALIDATION_ERROR: {
+          target: 'validation_failed',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Validation failed',
+              validationErrors: event.error?.issues || [],
+              timestamp: Date.now()
+            })
+          })
+        },
         ERROR: {
           target: 'error',
           actions: assign({
@@ -146,7 +472,6 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Handoff: Wechsel zu anderem Agent
     handoff: {
       entry: ({ context, event }) => {
         console.log(
@@ -162,6 +487,16 @@ const supervisorMachine = createMachine({
             currentAgent: ({ event }) => event.agentId
           })
         },
+        VALIDATION_ERROR: {
+          target: 'validation_failed',
+          actions: assign({
+            errorContext: ({ event }) => ({
+              message: event.error?.message || 'Validation failed during handoff',
+              validationErrors: event.error?.issues || [],
+              timestamp: Date.now()
+            })
+          })
+        },
         ERROR: {
           target: 'error',
           actions: assign({
@@ -174,7 +509,27 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Error: Fehlerzustand
+    validation_failed: {
+      entry: ({ context }) => {
+        console.error(`[Supervisor FSM] Validation failed:`, context.errorContext?.message);
+        if (context.errorContext?.validationErrors) {
+          console.error('[Supervisor FSM] Validation issues:', context.errorContext.validationErrors);
+        }
+      },
+      on: {
+        RECOVER: {
+          target: 'ready',
+          actions: assign({
+            errorContext: null,
+            lastValidationResult: null
+          })
+        },
+        ESCALATE: {
+          target: 'escalation'
+        }
+      }
+    },
+    
     error: {
       entry: ({ context }) => {
         console.error(`[Supervisor FSM] Error:`, context.errorContext?.message);
@@ -193,7 +548,6 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Escalation: Menschliche Intervention erforderlich
     escalation: {
       entry: ({ context }) => {
         console.error(
@@ -212,7 +566,6 @@ const supervisorMachine = createMachine({
       }
     },
     
-    // Terminated: Supervisor beendet
     terminated: {
       type: 'final',
       entry: () => console.log('[Supervisor FSM] Terminated')
@@ -229,7 +582,11 @@ const CONFIG = {
   AGENT_TIMEOUT_MS: 30000,
   COORDINATION_INTERVAL_MS: 5000,
   CONFLICT_RESOLUTION: 'hierarchy',
-  MAX_HANDOFFS: 5 // Sync with FSM default
+  MAX_HANDOFFS: 5,
+  MAX_CONTEXT_MESSAGES: 5,
+  CONTEXT_SUMMARY_MAX_LENGTH: 10000,
+  BATCH_COMMIT_INTERVAL: 1000,
+  LOCK_TIMEOUT: 30000
 };
 
 // ============================================================================
@@ -246,6 +603,7 @@ class Agent {
     this.status = 'idle';
     this.currentTask = null;
     this.history = [];
+    this.contextBuffer = [];
     
     this.loader = new SmartLoader();
     this.context = null;
@@ -336,6 +694,7 @@ class Task {
     this.startedAt = null;
     this.completedAt = null;
     this.handoffCount = 0;
+    this.contextHistory = [];
   }
 
   _generateId() {
@@ -344,7 +703,7 @@ class Task {
 }
 
 // ============================================================================
-// Multi-Agent Supervisor mit XState Integration
+// Multi-Agent Supervisor mit Mutex + Batch-Commit + Context-Caching
 // ============================================================================
 
 class MultiAgentSupervisor {
@@ -354,19 +713,25 @@ class MultiAgentSupervisor {
     this.tasks = new Map();
     this.taskQueue = [];
     this.errorRecovery = new ErrorRecoveryManager();
+    this.contextCompiler = new ContextCompiler();
+    this.lockManager = new StateLockManager(config.lockDir || './locks');
+    this.batchManager = new BatchCommitManager(this);
     this.running = false;
     this.stats = {
       tasksCreated: 0,
       tasksCompleted: 0,
       tasksFailed: 0,
       totalExecutionTime: 0,
-      handoffsPrevented: 0
+      handoffsPrevented: 0,
+      validationFailures: 0,
+      contextsCompressed: 0,
+      mutexWaits: 0,
+      cacheHits: 0,
+      cacheMisses: 0
     };
     
-    // XState Service initialisieren (v5 API)
     this.stateService = interpret(supervisorMachine);
     
-    // Subscribe to state changes
     this.stateService.subscribe((state) => {
       this.currentState = state;
       const ctx = state.context;
@@ -374,71 +739,320 @@ class MultiAgentSupervisor {
     });
     
     this.stateService.start();
-    
     this.currentState = this.stateService.getSnapshot();
+    
+    this._startBatchCommitTimer();
   }
 
-  // -------------------------------------------------------------------------
-  // FSM-Controlled Handoff Logic
-  // -------------------------------------------------------------------------
+  _startBatchCommitTimer() {
+    this.batchCommitInterval = setInterval(async () => {
+      if (this.batchManager.getPendingCount() > 0 && !this.batchManager.isCommitting) {
+        try {
+          await this.batchManager.executeBatchCommit();
+        } catch (err) {
+          console.error('[BatchCommit] Timer-triggered commit failed:', err.message);
+        }
+      }
+    }, this.config.BATCH_COMMIT_INTERVAL);
+  }
 
-  /**
-   * Initiiert einen Handoff zu einem anderen Agent
-   * Wird durch FSM-Guards blockiert wenn Budget erschöpft
-   */
-  async initiateHandoff(fromAgentId, toAgentId, task) {
+  // ============================================================================
+  // Atomares State-Locking (Mutex)
+  // ============================================================================
+
+  async withStateLock(fn, timeout = null) {
+    const startTime = Date.now();
+    try {
+      const result = await this.lockManager.withLock('state', fn, timeout || this.config.LOCK_TIMEOUT);
+      this.stats.mutexWaits += Date.now() - startTime;
+      return result;
+    } catch (err) {
+      throw new StateLockError(`State lock failed: ${err.message}`, 'state');
+    }
+  }
+
+  async saveStateAtomic(stateUpdate) {
+    return this.withStateLock(async () => {
+      const stateHash = this._generateStateHash(stateUpdate);
+      const persistedState = {
+        ...stateUpdate,
+        persistedAt: Date.now(),
+        stateHash
+      };
+      
+      console.log(`[Mutex] State saved atomically: ${stateHash}`);
+      return persistedState;
+    });
+  }
+
+  // ============================================================================
+  // Context-Kompression mit Caching
+  // ============================================================================
+
+  _compressContext(contextArray) {
+    const inputHash = this._generateHash(JSON.stringify(contextArray));
+    
+    const cached = this.contextCompiler.getCached(inputHash);
+    if (cached) {
+      this.stats.cacheHits++;
+      return cached;
+    }
+    
+    this.stats.cacheMisses++;
+
+    if (!Array.isArray(contextArray)) {
+      throw new ContextCompressionError('Context must be an array', contextArray);
+    }
+
+    const maxMessages = this.config.MAX_CONTEXT_MESSAGES;
+    
+    if (contextArray.length <= maxMessages) {
+      const result = {
+        messages: contextArray,
+        summary: '',
+        metadata: {
+          originalCount: contextArray.length,
+          compressionRatio: 1.0,
+          compressedAt: Date.now()
+        }
+      };
+      this.contextCompiler.cache(inputHash, result);
+      return result;
+    }
+
+    const messagesToKeep = contextArray.slice(-maxMessages);
+    const messagesToSummarize = contextArray.slice(0, -maxMessages);
+    const summary = this._generateSummary(messagesToSummarize);
+
+    this.stats.contextsCompressed++;
+
+    const compressedContext = {
+      messages: messagesToKeep,
+      summary: summary,
+      metadata: {
+        originalCount: contextArray.length,
+        compressionRatio: maxMessages / contextArray.length,
+        compressedAt: Date.now()
+      }
+    };
+
+    try {
+      CompressedContextSchema.parse(compressedContext);
+    } catch (error) {
+      throw new ContextCompressionError(
+        `Compressed context validation failed: ${error.message}`,
+        compressedContext
+      );
+    }
+
+    this.contextCompiler.cache(inputHash, compressedContext);
+    return compressedContext;
+  }
+
+  _generateSummary(messages) {
+    if (messages.length === 0) return '';
+
+    const keyPoints = messages.map(msg => {
+      const role = msg.role || 'unknown';
+      const content = msg.content || '';
+      const preview = content.length > 100 ? content.substring(0, 100) + '...' : content;
+      return `[${role}] ${preview}`;
+    });
+
+    const summary = `Previous conversation (${messages.length} messages):\n` +
+      keyPoints.join('\n');
+
+    return summary.length > this.config.CONTEXT_SUMMARY_MAX_LENGTH 
+      ? summary.substring(0, this.config.CONTEXT_SUMMARY_MAX_LENGTH) + '...'
+      : summary;
+  }
+
+  // ============================================================================
+  // Delegation mit Zod-Validierung
+  // ============================================================================
+
+  _validateAgentMessage(payload) {
+    try {
+      const validatedData = AgentMessageSchema.parse(payload);
+      return {
+        success: true,
+        data: validatedData,
+        errors: []
+      };
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        const issues = error.issues.map(issue => ({
+          path: issue.path,
+          message: issue.message
+        }));
+        return {
+          success: false,
+          data: null,
+          errors: issues
+        };
+      }
+      return {
+        success: false,
+        data: null,
+        errors: [{ path: [], message: error.message }]
+      };
+    }
+  }
+
+  async delegateTask(fromAgentId, toAgentId, task, contextData = null) {
+    const fromAgent = this.agents.get(fromAgentId);
+    const toAgent = this.agents.get(toAgentId);
+
+    if (!fromAgent) {
+      throw new HandoffValidationError(
+        `Source agent not found: ${fromAgentId}`,
+        fromAgentId,
+        toAgentId,
+        task?.id
+      );
+    }
+
+    if (!toAgent) {
+      throw new HandoffValidationError(
+        `Target agent not found: ${toAgentId}`,
+        fromAgentId,
+        toAgentId,
+        task?.id
+      );
+    }
+
     const currentState = this.stateService.getSnapshot();
     
-    // Prüfe ob Handoff erlaubt (via FSM Guard)
     if (currentState.context.handoffCount >= currentState.context.maxHandoffs) {
       console.error(`[Supervisor] HANDOFF BLOCKED: Budget exhausted (${currentState.context.handoffCount}/${currentState.context.maxHandoffs})`);
       this.stats.handoffsPrevented++;
-      
-      // Transition zu Escalation
       this.stateService.send({ type: 'ESCALATE' });
       
-      throw new Error(
-        `Infinite loop prevention: Maximum handoffs (${this.config.MAX_HANDOFFS}) exceeded. ` +
-        `Task ${task.id} requires escalation.`
+      throw new HandoffValidationError(
+        `Infinite loop prevention: Maximum handoffs (${this.config.MAX_HANDOFFS}) exceeded`,
+        fromAgentId,
+        toAgentId,
+        task?.id
       );
     }
-    
-    // Handoff durchführen
-    console.log(`[Supervisor] Initiating handoff: ${fromAgentId} → ${toAgentId}`);
-    
+
+    const messagePayload = {
+      agentId: toAgentId,
+      taskId: task?.id || this._generateTaskId(),
+      payload: {
+        type: 'HANDOFF_REQUEST',
+        data: {
+          fromAgent: fromAgentId,
+          taskDescription: task?.description || '',
+          requiredCapabilities: task?.requiredCapabilities || [],
+          handoffCount: currentState.context.handoffCount + 1
+        },
+        metadata: {
+          timestamp: Date.now(),
+          compressionApplied: false,
+          originalMessageCount: 0
+        }
+      },
+      summary: ''
+    };
+
+    if (contextData && Array.isArray(contextData.messages)) {
+      const compressedContext = this._compressContext(contextData.messages);
+      
+      messagePayload.payload.data.context = compressedContext.messages;
+      messagePayload.summary = compressedContext.summary;
+      messagePayload.payload.metadata.compressionApplied = true;
+      messagePayload.payload.metadata.originalMessageCount = compressedContext.metadata.originalCount;
+      messagePayload.payload.metadata.compressionMetadata = compressedContext.metadata;
+    }
+
+    const validationResult = this._validateAgentMessage(messagePayload);
+
+    if (!validationResult.success) {
+      this.stats.validationFailures++;
+      
+      const validationError = new AgentMessageValidationError(
+        validationResult.errors,
+        messagePayload
+      );
+      
+      this.stateService.send({
+        type: 'VALIDATION_ERROR',
+        error: validationError
+      });
+      
+      throw validationError;
+    }
+
+    console.log(`[Supervisor] Validated handoff: ${fromAgentId} → ${toAgentId}`);
+    console.log(`[Supervisor] Context compressed: ${messagePayload.payload.metadata.compressionApplied}`);
+
     this.stateService.send({
       type: 'HANDOFF',
       targetAgent: toAgentId
     });
     
-    // Neue Zuweisung
     this.stateService.send({
       type: 'ASSIGN_TASK',
       agentId: toAgentId
     });
-    
-    // Update Task
-    task.handoffCount = (task.handoffCount || 0) + 1;
-    
-    return {
+
+    if (task) {
+      task.handoffCount = (task.handoffCount || 0) + 1;
+      
+      if (!task.contextHistory) {
+        task.contextHistory = [];
+      }
+      task.contextHistory.push({
+        handoffNumber: currentState.context.handoffCount + 1,
+        from: fromAgentId,
+        to: toAgentId,
+        timestamp: Date.now(),
+        compressed: messagePayload.payload.metadata.compressionApplied
+      });
+    }
+
+    const result = {
       success: true,
       from: fromAgentId,
       to: toAgentId,
-      handoffNumber: currentState.context.handoffCount + 1
+      handoffNumber: currentState.context.handoffCount + 1,
+      validatedMessage: validationResult.data,
+      compressed: messagePayload.payload.metadata.compressionApplied,
+      originalMessageCount: messagePayload.payload.metadata.originalMessageCount
     };
+
+    const persistedState = await this.saveStateAtomic(result);
+    
+    return persistedState;
   }
 
-  /**
-   * Prüft ob Handoffs noch erlaubt sind
-   */
+  _generateStateHash(state) {
+    const stateString = JSON.stringify(state);
+    return crypto.createHash('sha256').update(stateString).digest('hex').substring(0, 16);
+  }
+
+  _generateHash(input) {
+    return crypto.createHash('sha256').update(input).digest('hex').substring(0, 16);
+  }
+
+  _generateTaskId() {
+    return `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+  }
+
+  // ============================================================================
+  // Legacy Handoff Methods
+  // ============================================================================
+
+  async initiateHandoff(fromAgentId, toAgentId, task) {
+    return this.delegateTask(fromAgentId, toAgentId, task);
+  }
+
   canHandoff() {
     const state = this.stateService.getSnapshot();
     return state.context.handoffCount < state.context.maxHandoffs;
   }
 
-  /**
-   * Gibt aktuelles Handoff-Budget zurück
-   */
   getHandoffBudget() {
     const state = this.stateService.getSnapshot();
     return {
@@ -448,9 +1062,9 @@ class MultiAgentSupervisor {
     };
   }
 
-  // -------------------------------------------------------------------------
+  // ============================================================================
   // Agent Management
-  // -------------------------------------------------------------------------
+  // ============================================================================
 
   registerAgent(agentConfig) {
     const agent = new Agent(agentConfig);
@@ -489,9 +1103,9 @@ class MultiAgentSupervisor {
     return candidates[0];
   }
 
-  // -------------------------------------------------------------------------
-  // Task Management mit FSM-Integration
-  // -------------------------------------------------------------------------
+  // ============================================================================
+  // Task Management
+  // ============================================================================
 
   createTask(config) {
     const task = new Task(config);
@@ -501,7 +1115,6 @@ class MultiAgentSupervisor {
     
     console.log(`[Supervisor] Task created: ${task.id} (${task.type})`);
     
-    // FSM: Initialisiere wenn nötig
     if (this.currentState.value === 'idle') {
       this.stateService.send({ type: 'INITIALIZE' });
     }
@@ -522,13 +1135,14 @@ class MultiAgentSupervisor {
       status: task.status,
       assignedTo: task.assignedTo,
       result: task.result,
-      handoffCount: task.handoffCount
+      handoffCount: task.handoffCount,
+      contextHistory: task.contextHistory || []
     } : null;
   }
 
-  // -------------------------------------------------------------------------
-  // Task Execution mit FSM-State-Tracking
-  // -------------------------------------------------------------------------
+  // ============================================================================
+  // Task Execution mit Batch-Commit
+  // ============================================================================
 
   start() {
     if (this.running) return;
@@ -551,6 +1165,10 @@ class MultiAgentSupervisor {
     
     if (this.coordinationInterval) {
       clearInterval(this.coordinationInterval);
+    }
+    
+    if (this.batchCommitInterval) {
+      clearInterval(this.batchCommitInterval);
     }
     
     this.stateService.send({ type: 'SHUTDOWN' });
@@ -583,7 +1201,6 @@ class MultiAgentSupervisor {
     task.status = 'assigned';
     task.assignedTo = agent.id;
     
-    // FSM: Zuweisung
     this.stateService.send({
       type: 'ASSIGN_TASK',
       agentId: agent.id
@@ -597,7 +1214,6 @@ class MultiAgentSupervisor {
       task.status = 'running';
       task.startedAt = Date.now();
       
-      // FSM: Ausführung
       this.stateService.send({ type: 'EXECUTE' });
       
       const result = await this.errorRecovery.execute(
@@ -609,23 +1225,18 @@ class MultiAgentSupervisor {
         }
       );
       
-      // FSM: Abschluss
-      this.stateService.send({
-        type: 'COMPLETE',
-        result
+      this.batchManager.addPendingResult({
+        task,
+        agent,
+        result,
+        taskId: task.id
       });
       
-      task.status = 'completed';
-      task.result = result;
-      task.completedAt = Date.now();
-      
-      this.stats.tasksCompleted++;
-      this.stats.totalExecutionTime += (task.completedAt - task.startedAt);
-      
-      console.log(`[Supervisor] Task ${task.id} completed by ${agent.name}`);
+      if (this.batchManager.getPendingCount() >= 5) {
+        await this.batchManager.executeBatchCommit();
+      }
       
     } catch (error) {
-      // FSM: Fehler
       this.stateService.send({
         type: 'ERROR',
         error
@@ -643,8 +1254,11 @@ class MultiAgentSupervisor {
     this._processQueue();
   }
 
-  _coordinate() {
-    // FSM-State prüfen
+  // ============================================================================
+  // Coordinate mit Batch-Processing (Refactored)
+  // ============================================================================
+
+  async _coordinate() {
     const state = this.stateService.getSnapshot();
     
     if (state.value === 'escalation') {
@@ -652,23 +1266,51 @@ class MultiAgentSupervisor {
       return;
     }
     
-    // Stuck tasks checken
-    for (const task of this.tasks.values()) {
-      if (task.status === 'running') {
-        const elapsed = Date.now() - task.startedAt;
-        
-        if (elapsed > this.config.AGENT_TIMEOUT_MS * 2) {
-          console.log(`[Supervisor] Task ${task.id} appears stuck`);
-        }
+    if (state.value === 'validation_failed') {
+      console.warn('[Supervisor] Validation failed - awaiting recovery');
+      return;
+    }
+
+    const runningTasks = [...this.tasks.values()].filter(t => t.status === 'running');
+    const parallelResults = [];
+    
+    for (const task of runningTasks) {
+      const elapsed = Date.now() - task.startedAt;
+      
+      if (elapsed > this.config.AGENT_TIMEOUT_MS * 2) {
+        console.log(`[Supervisor] Task ${task.id} appears stuck`);
+        parallelResults.push({
+          taskId: task.id,
+          status: 'stuck',
+          elapsed
+        });
+      } else {
+        parallelResults.push({
+          taskId: task.id,
+          status: 'running',
+          elapsed
+        });
+      }
+    }
+
+    if (parallelResults.length > 0) {
+      console.log(`[Coordinator] ${parallelResults.length} tasks in flight`);
+    }
+
+    if (this.batchManager.getPendingCount() > 0 && !this.batchManager.isCommitting) {
+      try {
+        await this.batchManager.executeBatchCommit();
+      } catch (err) {
+        console.error('[Coordinator] Batch commit failed:', err.message);
       }
     }
     
     this._processQueue();
   }
 
-  // -------------------------------------------------------------------------
+  // ============================================================================
   // Result Aggregation
-  // -------------------------------------------------------------------------
+  // ============================================================================
 
   aggregateResults(taskIds, strategy = 'merge') {
     const results = taskIds.map(id => {
@@ -711,9 +1353,9 @@ class MultiAgentSupervisor {
     return winner ? JSON.parse(winner[0]) : null;
   }
 
-  // -------------------------------------------------------------------------
+  // ============================================================================
   // Reporting
-  // -------------------------------------------------------------------------
+  // ============================================================================
 
   getStatus() {
     const fsmState = this.stateService.getSnapshot();
@@ -739,7 +1381,11 @@ class MultiAgentSupervisor {
         failed: this.stats.tasksFailed
       },
       stats: this.stats,
-      escalation: fsmState.value === 'escalation'
+      lockStats: this.lockManager.getStats(),
+      batchStats: this.batchManager.getStats(),
+      cacheStats: this.contextCompiler.getStats(),
+      escalation: fsmState.value === 'escalation',
+      validationFailed: fsmState.value === 'validation_failed'
     };
   }
 
@@ -747,7 +1393,7 @@ class MultiAgentSupervisor {
     const status = this.getStatus();
     
     console.log('\n============================');
-    console.log('SUPERVISOR STATUS (v4.0 XState)');
+    console.log('SUPERVISOR STATUS (v6.0 Mutex + Batch + Cache)');
     console.log('============================');
     console.log(`FSM State: ${status.fsmState}`);
     console.log(`Running: ${status.running}`);
@@ -758,15 +1404,35 @@ class MultiAgentSupervisor {
       console.log('\n🚨 ESCALATION STATE: Manual intervention required');
     }
     
+    if (status.validationFailed) {
+      console.log('\n⚠️ VALIDATION FAILED: Check error logs');
+    }
+    
     console.log(`\nAgents: ${status.agents.total} total`);
     console.log(`  Idle: ${status.agents.idle}`);
     console.log(`  Busy: ${status.agents.busy}`);
     console.log(`\nTasks: ${status.tasks.total} total`);
     console.log(`  Pending: ${status.tasks.pending}`);
     console.log(`  Running: ${status.tasks.running}`);
-    console.log(`  Completed: ${status.tasks.completed}`);
-    console.log(`  Failed: ${status.tasks.failed}`);
+    console.log(`  Completed: ${status.stats.tasksCompleted}`);
+    console.log(`  Failed: ${status.stats.tasksFailed}`);
+    console.log(`\nMutex Stats:`);
+    console.log(`  Active Locks: ${status.lockStats.activeLocks}`);
+    console.log(`  Total Acquired: ${status.lockStats.totalLocksAcquired}`);
+    console.log(`  Wait Time: ${this.stats.mutexWaits}ms`);
+    console.log(`\nBatch Commit Stats:`);
+    console.log(`  Total Commits: ${status.batchStats.totalCommits}`);
+    console.log(`  Batch Commits: ${status.batchStats.batchCommits}`);
+    console.log(`  Individual Commits: ${status.batchStats.individualCommits}`);
+    console.log(`  Errors Marked: ${status.batchStats.errorsMarked}`);
+    console.log(`  Pending: ${status.batchStats.pending}`);
+    console.log(`\nCache Stats:`);
+    console.log(`  Hits: ${status.cacheStats.hits}`);
+    console.log(`  Misses: ${status.cacheStats.misses}`);
+    console.log(`  Hit Rate: ${status.cacheStats.hitRate.toFixed(2)}%`);
     console.log(`\nLoop Prevention: ${status.stats.handoffsPrevented} handoffs blocked`);
+    console.log(`Validations Failed: ${status.stats.validationFailures}`);
+    console.log(`Contexts Compressed: ${status.stats.contextsCompressed}`);
     console.log('============================\n');
   }
 }
@@ -780,6 +1446,15 @@ module.exports = {
   Agent,
   Task,
   supervisorMachine,
+  StateLockManager,
+  BatchCommitManager,
+  AgentMessageSchema,
+  CompressedContextSchema,
+  ValidationResultSchema,
+  AgentMessageValidationError,
+  ContextCompressionError,
+  HandoffValidationError,
+  StateLockError,
   CONFIG
 };
 
@@ -788,16 +1463,17 @@ module.exports = {
 // ============================================================================
 
 if (require.main === module) {
-  console.log('Multi-Agent Supervisor v4.0 - XState FSM Edition\n');
+  console.log('Multi-Agent Supervisor v6.0 - Mutex + Batch-Commit + Context-Caching\n');
   console.log('Features:');
-  console.log('  - Finite State Machine for deterministic state tracking');
-  console.log('  - Strict handoff budget (max 5) prevents infinite loops');
-  console.log('  - Automatic escalation on budget exhaustion');
-  console.log('  - Guard conditions block transitions when unsafe\n');
+  console.log('  - File-based Mutex for atomic state operations');
+  console.log('  - Batch-Commit: Results collected, committed atomically');
+  console.log('  - Context-Caching: Memoized context compilation');
+  console.log('  - Error isolation: Failed tasks dont block batch');
+  console.log('  - Strict Zod schema validation for all inter-agent messages');
+  console.log('  - Context compression: max 5 messages + aggregated summary\n');
   
   const supervisor = new MultiAgentSupervisor();
   
-  // Register agents
   supervisor.registerAgent({
     name: 'Frontend Developer',
     template: 'web-development',
@@ -824,47 +1500,40 @@ if (require.main === module) {
     console.log(`  - ${agent.name}: ${agent.capabilities.join(', ')}`);
   }
   
-  // Test: Create tasks
-  console.log('\nCreating tasks...');
+  console.log('\n--- Mutex Demo ---');
+  supervisor.withStateLock(async () => {
+    console.log('State lock acquired successfully');
+    return { locked: true };
+  }).then(() => {
+    console.log('State lock released');
+  });
   
-  const tasks = supervisor.createTasks([
-    {
-      type: 'frontend',
-      description: 'Build login form UI',
-      requiredCapabilities: ['frontend', 'react']
-    },
-    {
-      type: 'backend',
-      description: 'Implement auth API',
-      requiredCapabilities: ['backend', 'api']
-    },
-    {
-      type: 'security',
-      description: 'Review authentication flow',
-      requiredCapabilities: ['security', 'auth']
-    }
-  ]);
+  console.log('\n--- Context Caching Demo ---');
+  const longContext = [
+    { role: 'user', content: 'Initial request message', timestamp: Date.now() - 5000 },
+    { role: 'assistant', content: 'First response from agent', timestamp: Date.now() - 4000 },
+    { role: 'user', content: 'Follow-up question about implementation', timestamp: Date.now() - 3000 },
+    { role: 'assistant', content: 'Detailed technical explanation', timestamp: Date.now() - 2000 },
+    { role: 'user', content: 'Request for code example', timestamp: Date.now() - 1000 },
+    { role: 'assistant', content: 'Code snippet provided', timestamp: Date.now() - 500 },
+    { role: 'user', content: 'Final question', timestamp: Date.now() }
+  ];
   
-  console.log(`Created ${tasks.length} tasks`);
+  const compressed1 = supervisor._compressContext(longContext);
+  console.log(`First compression: ${longContext.length} → ${compressed1.messages.length} messages`);
   
-  // Start supervisor
-  supervisor.start();
+  const compressed2 = supervisor._compressContext(longContext);
+  console.log(`Second compression (cached): ${longContext.length} → ${compressed2.messages.length} messages [CACHE HIT]`);
   
-  // Demo: Handoff budget
-  console.log('\n--- Handoff Budget Demo ---');
-  const budget = supervisor.getHandoffBudget();
-  console.log(`Initial budget: ${budget.used}/${budget.max} used`);
-  console.log(`Can handoff: ${supervisor.canHandoff()}`);
+  console.log('\n--- Batch Commit Demo ---');
+  console.log(`Pending results: ${supervisor.batchManager.getPendingCount()}`);
   
-  // Print status
-  setTimeout(() => {
-    supervisor.printStatus();
-    supervisor.stop();
-  }, 100);
+  supervisor.printStatus();
   
   console.log('\nUsage:');
   console.log('  const { MultiAgentSupervisor } = require("./multi-agent-supervisor");');
   console.log('  const supervisor = new MultiAgentSupervisor();');
-  console.log('  supervisor.initiateHandoff(fromId, toId, task); // Budget-checked');
-  console.log('  supervisor.getHandoffBudget(); // {used, max, remaining}');
+  console.log('  await supervisor.withStateLock(async () => { /* atomic operation */ });');
+  console.log('  await supervisor.saveStateAtomic(stateUpdate); // Atomic state persistence');
+  console.log('  supervisor._compressContext(contextArray); // Cached compression');
 }

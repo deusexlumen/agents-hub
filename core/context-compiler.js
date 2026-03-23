@@ -1,341 +1,541 @@
 /**
- * Context Compiler
+ * Context Compiler v3.0
  * 
- * Kompiliert vor jedem LLM-Aufruf:
- * 1. Basis-Philosophie (AGENTS-AUTONOMOUS.md)
- * 2. Aktuelles Gedächtnis (learning_data/history.json)
- * 3. User-Input
- * 
- * Zu einem einzigen Master-Prompt.
+ * Memoized context compilation with LRU caching
+ * JSON-Only Output Instructions für LLM-Kommunikation
  * 
  * @module context-compiler
  * @version 3.0.0
  */
 
-const fs = require('fs');
-const path = require('path');
+import crypto from 'crypto';
 
-class ContextCompiler {
+// ============================================================================
+// JSON-Only System Instructions
+// ============================================================================
+
+/**
+ * System-Instructions die den LLM zwingen, NUR im JSON-Format zu antworten
+ * Diese werden automatisch an Contexte angehängt
+ */
+export const JSON_ONLY_INSTRUCTIONS = `CRITICAL OUTPUT FORMAT:
+You MUST respond with ONLY a valid JSON object. No markdown, no code blocks, no explanations outside the JSON.
+
+Required structure:
+{
+  "memory": ["observation 1", "observation 2"],
+  "status": "idle|ready|planning|executing|reviewing|completed|error|paused",
+  "next_step": "description of next action",
+  "confidence": 0.0-1.0,
+  "metadata": { "optional": "fields" }
+}
+
+Rules:
+- Response MUST start with '{' and end with '}'
+- Use double quotes for all strings and keys
+- No text before or after the JSON object
+- Ensure valid JSON syntax (no trailing commas)
+
+Invalid JSON will cause a retry request.`;
+
+// ============================================================================
+// LRU Cache Implementation
+// ============================================================================
+
+export class LRUCache {
+  constructor(maxSize = 100) {
+    this.maxSize = maxSize;
+    this.cache = new Map();
+    this.stats = {
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      size: 0
+    };
+  }
+
+  get(key) {
+    if (this.cache.has(key)) {
+      const value = this.cache.get(key);
+      this.cache.delete(key);
+      this.cache.set(key, value);
+      this.stats.hits++;
+      return value;
+    }
+    this.stats.misses++;
+    return undefined;
+  }
+
+  set(key, value) {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+      this.stats.evictions++;
+    }
+    
+    this.cache.set(key, value);
+    this.stats.size = this.cache.size;
+  }
+
+  has(key) {
+    return this.cache.has(key);
+  }
+
+  delete(key) {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+      this.stats.size = this.cache.size;
+      return true;
+    }
+    return false;
+  }
+
+  clear() {
+    this.cache.clear();
+    this.stats.size = 0;
+    this.stats.evictions = 0;
+  }
+
+  getStats() {
+    const total = this.stats.hits + this.stats.misses;
+    return {
+      ...this.stats,
+      hitRate: total > 0 ? (this.stats.hits / total) * 100 : 0,
+      totalRequests: total
+    };
+  }
+}
+
+// ============================================================================
+// Context Compiler with Memoization
+// ============================================================================
+
+export class ContextCompiler {
   constructor(config = {}) {
+    this.cache = new LRUCache(config.cacheSize || 100);
     this.config = {
-      basePhilosophyPath: config.basePhilosophyPath || './AGENTS-AUTONOMOUS.md',
-      learningDataPath: config.learningDataPath || './learning_data/history.json',
-      maxHistoryEntries: config.maxHistoryEntries || 50,
-      cacheEnabled: config.cacheEnabled !== false
+      maxContextLength: config.maxContextLength || 10000,
+      includeMetadata: config.includeMetadata !== false,
+      compressSummaries: config.compressSummaries !== false,
+      enforceJSONOutput: config.enforceJSONOutput !== false,
+      ...config
     };
-    
-    this.cache = {
-      philosophy: null,
-      philosophyMtime: null,
-      learningData: null,
-      learningDataMtime: null
+    this.compilationStats = {
+      totalCompilations: 0,
+      cachedCompilations: 0,
+      uncachedCompilations: 0,
+      averageCompilationTime: 0
     };
   }
 
   /**
-   * Kompiliert den Master-Prompt aus allen Kontextquellen
-   * @param {Object} params - Kompilierungs-Parameter
-   * @param {string} params.sessionId - Aktuelle Session-ID
-   * @param {string} params.userInput - User-Input
-   * @param {Object} params.currentState - Aktueller Session-State
-   * @returns {string} Der komplette Master-Prompt
+   * Generiert einen Hash für den inputState
+   * 
+   * @param {Object} inputState - Der zu hashende Input-State
+   * @returns {String} SHA-256 Hash (16 Zeichen)
    */
-  async compile(params) {
-    const { sessionId, userInput, currentState } = params;
-    
-    // Lade alle Kontextkomponenten
-    const philosophy = await this.loadBasePhilosophy();
-    const learningData = await this.loadLearningData();
-    const stateContext = this.formatStateContext(currentState);
-    
-    // Kompiliere Master-Prompt
-    const masterPrompt = this.buildMasterPrompt({
-      philosophy,
-      learningData,
-      stateContext,
-      sessionId,
-      userInput
-    });
-    
-    return masterPrompt;
+  _generateHash(inputState) {
+    const normalized = JSON.stringify(inputState, Object.keys(inputState).sort());
+    return crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 16);
   }
 
   /**
-   * Lädt die Basis-Philosophie mit Caching
+   * Memoized compileContext Methode
+   * Nutzt einen Hash des inputState als Cache-Key
+   * 
+   * @param {Object} inputState - Der zu kompilierende Input-State
+   * @param {Object} options - Optionale Kompilierungs-Optionen
+   * @returns {Object} Kompilierter Context
    */
-  async loadBasePhilosophy() {
-    const filePath = this.config.basePhilosophyPath;
+  compileContext(inputState, options = {}) {
+    const startTime = Date.now();
+    const cacheKey = this._generateHash(inputState);
     
-    // Fallback wenn Datei nicht existiert
-    if (!fs.existsSync(filePath)) {
-      console.log(`[ContextCompiler] Philosophy file not found: ${filePath}`);
-      return this.getDefaultPhilosophy();
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.compilationStats.totalCompilations++;
+      this.compilationStats.cachedCompilations++;
+      return {
+        ...cached,
+        _cached: true,
+        _cacheKey: cacheKey,
+        _compileTime: Date.now() - startTime
+      };
     }
+
+    const compiled = this._performCompilation(inputState, options);
     
-    // Check cache
-    const stats = fs.statSync(filePath);
-    if (this.config.cacheEnabled && 
-        this.cache.philosophy && 
-        this.cache.philosophyMtime?.getTime() === stats.mtime.getTime()) {
-      return this.cache.philosophy;
-    }
+    this.cache.set(cacheKey, compiled);
     
-    // Load and cache
-    const content = fs.readFileSync(filePath, 'utf8');
+    const compileTime = Date.now() - startTime;
+    this.compilationStats.totalCompilations++;
+    this.compilationStats.uncachedCompilations++;
     
-    if (this.config.cacheEnabled) {
-      this.cache.philosophy = content;
-      this.cache.philosophyMtime = stats.mtime;
-    }
-    
-    return content;
+    const prevAvg = this.compilationStats.averageCompilationTime;
+    const total = this.compilationStats.uncachedCompilations;
+    this.compilationStats.averageCompilationTime = 
+      (prevAvg * (total - 1) + compileTime) / total;
+
+    return {
+      ...compiled,
+      _cached: false,
+      _cacheKey: cacheKey,
+      _compileTime: compileTime
+    };
   }
 
   /**
-   * Lädt die Learning-Daten mit Caching
+   * Interne Kompilierungs-Logik
+   * 
+   * @param {Object} inputState - Der zu kompilierende Input
+   * @param {Object} options - Kompilierungs-Optionen
+   * @returns {Object} Kompilierter Context
    */
-  async loadLearningData() {
-    const filePath = this.config.learningDataPath;
-    
-    // Fallback wenn Datei nicht existiert
-    if (!fs.existsSync(filePath)) {
-      return this.getDefaultLearningData();
-    }
-    
-    // Check cache
-    const stats = fs.statSync(filePath);
-    if (this.config.cacheEnabled && 
-        this.cache.learningData && 
-        this.cache.learningDataMtime?.getTime() === stats.mtime.getTime()) {
-      return this.cache.learningData;
-    }
-    
-    // Load and parse
-    try {
-      const content = fs.readFileSync(filePath, 'utf8');
-      const data = JSON.parse(content);
-      
-      // Limit entries
-      const limited = this.limitHistoryEntries(data);
-      
-      if (this.config.cacheEnabled) {
-        this.cache.learningData = limited;
-        this.cache.learningDataMtime = stats.mtime;
-      }
-      
-      return limited;
-    } catch (e) {
-      console.error(`[ContextCompiler] Failed to parse learning data: ${e.message}`);
-      return this.getDefaultLearningData();
-    }
+  _performCompilation(inputState, options) {
+    const {
+      messages = [],
+      metadata = {},
+      context = {},
+      systemPrompt = null
+    } = inputState;
+
+    const compiledMessages = this._compileMessages(messages, options);
+    const compiledMetadata = this._compileMetadata(metadata, options);
+    const compiledContext = this._compileContextData(context, options);
+
+    // Füge JSON-Only Instructions hinzu wenn aktiviert
+    const finalSystemPrompt = this._buildSystemPrompt(systemPrompt, options);
+
+    return {
+      messages: compiledMessages,
+      metadata: compiledMetadata,
+      context: compiledContext,
+      systemPrompt: finalSystemPrompt,
+      compiledAt: Date.now(),
+      version: '3.0.0',
+      jsonEnforced: this.config.enforceJSONOutput
+    };
   }
 
   /**
-   * Limitiert die Anzahl der History-Einträge
+   * Baut System-Prompt mit JSON-Only Instructions
+   * 
+   * @param {String} customPrompt - Optionaler custom System-Prompt
+   * @param {Object} options - Optionen
+   * @returns {String} Finaler System-Prompt
    */
-  limitHistoryEntries(data) {
-    if (!data || typeof data !== 'object') {
-      return data;
-    }
-    
-    const result = { ...data };
-    
-    // Limit history array if present
-    if (Array.isArray(result.history)) {
-      result.history = result.history.slice(-this.config.maxHistoryEntries);
-    }
-    
-    // Limit interactions if present
-    if (Array.isArray(result.interactions)) {
-      result.interactions = result.interactions.slice(-this.config.maxHistoryEntries);
-    }
-    
-    return result;
-  }
-
-  /**
-   * Formatiert den Session-State als lesbaren Kontext
-   */
-  formatStateContext(state) {
-    if (!state) {
-      return 'No active session state.';
-    }
+  _buildSystemPrompt(customPrompt, options) {
+    const enforceJSON = options.enforceJSONOutput ?? this.config.enforceJSONOutput;
     
     const parts = [];
     
-    // Session metadata
-    parts.push(`Session ID: ${state.metadata?.session_id || 'unknown'}`);
-    parts.push(`Current Phase: ${state.context?.current_phase || 'discovery'}`);
-    parts.push(`Workflow: ${state.context?.workflow_type || 'unknown'}`);
-    parts.push(`Duration: ${state.context?.session_duration_minutes || 0} minutes`);
-    parts.push(`Messages: ${state.metrics?.total_messages || 0}`);
-    
-    // Key decisions
-    if (state.memory?.key_decisions?.length > 0) {
-      parts.push('\nKey Decisions:');
-      state.memory.key_decisions.slice(-5).forEach((dec, i) => {
-        const text = typeof dec === 'string' ? dec : dec.description || JSON.stringify(dec);
-        parts.push(`  ${i + 1}. ${text.substring(0, 100)}${text.length > 100 ? '...' : ''}`);
-      });
+    if (enforceJSON) {
+      parts.push(JSON_ONLY_INSTRUCTIONS);
     }
     
-    // Current phase data
-    const currentPhase = state.context?.current_phase;
-    if (currentPhase && state.phases?.[currentPhase]) {
-      const phaseData = state.phases[currentPhase];
-      parts.push(`\nCurrent Phase Status: ${phaseData.status}`);
-      if (phaseData.data && Object.keys(phaseData.data).length > 0) {
-        parts.push('Phase Data:');
-        Object.entries(phaseData.data).forEach(([key, value]) => {
-          const valStr = typeof value === 'object' ? JSON.stringify(value) : String(value);
-          parts.push(`  ${key}: ${valStr.substring(0, 200)}${valStr.length > 200 ? '...' : ''}`);
-        });
+    if (customPrompt) {
+      parts.push(customPrompt);
+    }
+    
+    if (parts.length === 0) {
+      return null;
+    }
+    
+    return parts.join('\n\n---\n\n');
+  }
+
+  /**
+   * Kompiliert Messages mit optionaler Längen-Begrenzung
+   * 
+   * @param {Array} messages - Raw Messages
+   * @param {Object} options - Optionen
+   * @returns {Array} Kompilierte Messages
+   */
+  _compileMessages(messages, options) {
+    if (!Array.isArray(messages)) return [];
+
+    const maxLength = options.maxMessageLength || this.config.maxContextLength;
+    
+    return messages.map(msg => {
+      const compiled = {
+        role: msg.role || 'user',
+        content: this._truncateContent(msg.content, maxLength),
+        timestamp: msg.timestamp || Date.now()
+      };
+
+      if (this.config.includeMetadata && msg.metadata) {
+        compiled.metadata = msg.metadata;
       }
+
+      return compiled;
+    });
+  }
+
+  /**
+   * Kompiliert Metadata
+   * 
+   * @param {Object} metadata - Raw Metadata
+   * @param {Object} options - Optionen
+   * @returns {Object} Kompilierte Metadata
+   */
+  _compileMetadata(metadata, options) {
+    const compiled = {
+      ...metadata,
+      compiledAt: Date.now(),
+      compilerVersion: '3.0.0'
+    };
+
+    if (options.sessionId) {
+      compiled.sessionId = options.sessionId;
     }
-    
-    return parts.join('\n');
+
+    if (options.agentId) {
+      compiled.agentId = options.agentId;
+    }
+
+    if (this.config.enforceJSONOutput) {
+      compiled.outputFormat = 'json-only';
+    }
+
+    return compiled;
   }
 
   /**
-   * Baut den finalen Master-Prompt
+   * Kompiliert Context-Daten
+   * 
+   * @param {Object} context - Raw Context
+   * @param {Object} options - Optionen
+   * @returns {Object} Kompilierter Context
    */
-  buildMasterPrompt(components) {
-    const { philosophy, learningData, stateContext, sessionId, userInput } = components;
-    
-    const sections = [];
-    
-    // Header
-    sections.push('╔══════════════════════════════════════════════════════════════════════╗');
-    sections.push('║                    AGENTS HUB MASTER PROMPT v3.0                     ║');
-    sections.push('╚══════════════════════════════════════════════════════════════════════╝');
-    sections.push('');
-    
-    // Section 1: Base Philosophy
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('SECTION 1: BASE PHILOSOPHY (AGENTS-AUTONOMOUS.md)');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push(philosophy);
-    sections.push('');
-    
-    // Section 2: Learning Data
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('SECTION 2: LEARNING DATA & HISTORY');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push(JSON.stringify(learningData, null, 2));
-    sections.push('');
-    
-    // Section 3: Current State
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('SECTION 3: CURRENT SESSION STATE');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push(stateContext);
-    sections.push('');
-    
-    // Section 4: Output Rules (wichtig für Parsing)
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('SECTION 4: OUTPUT RULES (CRITICAL - MUST FOLLOW)');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push(`
-You MUST output structured updates using these XML-style tags:
+  _compileContextData(context, options) {
+    const compiled = { ...context };
 
-1. To update MEMORY (key decisions, preferences, patterns):
-<UPDATE_MEMORY>
-{
-  "key_decisions": ["decision 1", "decision 2"],
-  "user_preferences": {"theme": "dark"},
-  "learned_patterns": [{"name": "pattern1", "description": "..."}]
-}
-</UPDATE_MEMORY>
+    if (this.config.compressSummaries && compiled.summary) {
+      compiled.summary = this._compressSummary(compiled.summary);
+    }
 
-2. To update STATE (phase, metrics, context):
-<UPDATE_STATE>
-{
-  "current_phase": "planning",
-  "phase_data": {"planning": {"status": "active", "data": {...}}}
-}
-</UPDATE_STATE>
+    if (options.enrichContext) {
+      compiled.enriched = true;
+      compiled.enrichmentTimestamp = Date.now();
+    }
 
-IMPORTANT:
-- ALWAYS wrap updates in the specified tags
-- Use valid JSON inside the tags
-- Updates will be automatically parsed and persisted
-- Output updates BEFORE or AFTER your main response
-- The cleaned response (without tags) will be shown to the user
-`);
-    sections.push('');
-    
-    // Section 5: User Input
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('SECTION 5: USER INPUT (Process This)');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push(userInput);
-    sections.push('');
-    
-    // Footer
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    sections.push('END OF MASTER PROMPT - Generate your response now');
-    sections.push('═══════════════════════════════════════════════════════════════════════');
-    
-    return sections.join('\n');
+    return compiled;
   }
 
   /**
-   * Default Philosophy wenn AGENTS-AUTONOMOUS.md nicht existiert
+   * Truncated Content auf maximale Länge
+   * 
+   * @param {String} content - Der Content
+   * @param {Number} maxLength - Maximale Länge
+   * @returns {String} Getruncateter Content
    */
-  getDefaultPhilosophy() {
-    return `# AGENTS-AUTONOMOUS.md (Default)
-
-You are an autonomous AI agent operating within the Agents Hub system.
-
-## Core Principles
-
-1. **State Awareness**: You have access to the full session state including:
-   - Current phase (discovery, planning, execution, review, delivery)
-   - Previous decisions and their context
-   - User preferences and patterns
-   - Metrics and progress
-
-2. **Structured Output**: You MUST use structured output tags for updates:
-   - <UPDATE_MEMORY> for decisions, preferences, patterns
-   - <UPDATE_STATE> for phase transitions, metrics
-
-3. **Phase Awareness**: Respect the current phase:
-   - discovery: Ask questions, understand requirements
-   - planning: Create plans, define approaches
-   - execution: Implement, code, write, create
-   - review: Verify, test, improve
-   - delivery: Finalize, document, hand over
-
-4. **Continuous Learning**: Update learning data with new patterns and insights.
-
-5. **Self-Preservation**: Create checkpoints before risky operations.
-`;
+  _truncateContent(content, maxLength) {
+    if (!content) return '';
+    if (content.length <= maxLength) return content;
+    return content.substring(0, maxLength) + '...';
   }
 
   /**
-   * Default Learning Data wenn history.json nicht existiert
+   * Komprimiert einen Summary-Text
+   * 
+   * @param {String} summary - Der Summary
+   * @returns {String} Komprimierter Summary
    */
-  getDefaultLearningData() {
-    return {
-      version: '1.0',
-      created_at: new Date().toISOString(),
-      history: [],
-      patterns: [],
-      preferences: {}
+  _compressSummary(summary) {
+    if (!summary || summary.length < 500) return summary;
+    
+    const sentences = summary.split(/[.!?]+/).filter(s => s.trim());
+    const keySentences = sentences.slice(0, Math.ceil(sentences.length * 0.7));
+    
+    return keySentences.join('. ') + '.';
+  }
+
+  /**
+   * Cache-Management
+   */
+  getCached(hash) {
+    return this.cache.get(hash);
+  }
+
+  cache(hash, value) {
+    this.cache.set(hash, value);
+  }
+
+  invalidateCache(hash) {
+    return this.cache.delete(hash);
+  }
+
+  clearCache() {
+    this.cache.clear();
+    this.compilationStats = {
+      totalCompilations: 0,
+      cachedCompilations: 0,
+      uncachedCompilations: 0,
+      averageCompilationTime: 0
     };
   }
 
   /**
-   * Invalidiert den Cache (z.B. nach externen Änderungen)
+   * Memoize-Hilfsfunktion für beliebige Funktionen
+   * 
+   * @param {Function} fn - Die zu memoizierende Funktion
+   * @param {Object} options - Memoize-Optionen
+   * @returns {Function} Memoisierte Funktion
    */
-  invalidateCache() {
-    this.cache.philosophy = null;
-    this.cache.philosophyMtime = null;
-    this.cache.learningData = null;
-    this.cache.learningDataMtime = null;
+  static memoize(fn, options = {}) {
+    const cache = new LRUCache(options.cacheSize || 100);
+    const keyGenerator = options.keyGenerator || ((...args) => {
+      const normalized = JSON.stringify(args);
+      return crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 16);
+    });
+
+    const memoized = function(...args) {
+      const key = keyGenerator(...args);
+      
+      const cached = cache.get(key);
+      if (cached !== undefined) {
+        return cached;
+      }
+
+      const result = fn.apply(this, args);
+      
+      if (result && typeof result.then === 'function') {
+        return result.then(value => {
+          cache.set(key, Promise.resolve(value));
+          return value;
+        }).catch(err => {
+          cache.delete(key);
+          throw err;
+        });
+      }
+
+      cache.set(key, result);
+      return result;
+    };
+
+    memoized.cache = cache;
+    memoized.clearCache = () => cache.clear();
+    memoized.getCacheStats = () => cache.getStats();
+
+    return memoized;
+  }
+
+  /**
+   * Statistiken abrufen
+   */
+  getStats() {
+    return {
+      ...this.cache.getStats(),
+      compilation: { ...this.compilationStats },
+      config: { ...this.config }
+    };
+  }
+
+  /**
+   * Status-Report
+   */
+  printStats() {
+    const stats = this.getStats();
+    
+    console.log('\n============================');
+    console.log('CONTEXT COMPILER STATS (v3.0)');
+    console.log('============================');
+    console.log(`Cache Size: ${stats.size}/${this.cache.maxSize}`);
+    console.log(`Cache Hits: ${stats.hits}`);
+    console.log(`Cache Misses: ${stats.misses}`);
+    console.log(`Hit Rate: ${stats.hitRate.toFixed(2)}%`);
+    console.log(`Evictions: ${stats.evictions}`);
+    console.log(`\nCompilation Stats:`);
+    console.log(`  Total: ${stats.compilation.totalCompilations}`);
+    console.log(`  Cached: ${stats.compilation.cachedCompilations}`);
+    console.log(`  Uncached: ${stats.compilation.uncachedCompilations}`);
+    console.log(`  Avg Time: ${stats.compilation.averageCompilationTime.toFixed(2)}ms`);
+    console.log(`\nConfig:`);
+    console.log(`  JSON-Only Output: ${stats.config.enforceJSONOutput ? 'ENABLED' : 'DISABLED'}`);
+    console.log('============================\n');
   }
 }
 
-module.exports = {
-  ContextCompiler
-};
+// ============================================================================
+// Specialized Context Compilers
+// ============================================================================
+
+export class AgentContextCompiler extends ContextCompiler {
+  constructor(config = {}) {
+    super({
+      ...config,
+      maxContextLength: config.maxContextLength || 5000,
+      enforceJSONOutput: config.enforceJSONOutput !== false
+    });
+  }
+
+  compileAgentContext(agentState, taskContext, options = {}) {
+    const inputState = {
+      messages: agentState.history || [],
+      metadata: {
+        agentId: agentState.id,
+        agentName: agentState.name,
+        capabilities: agentState.capabilities,
+        ...agentState.metadata
+      },
+      context: {
+        taskId: taskContext.taskId,
+        taskType: taskContext.taskType,
+        taskDescription: taskContext.description,
+        ...taskContext
+      },
+      systemPrompt: options.systemPrompt || `You are agent "${agentState.name}". Respond with valid JSON.`
+    };
+
+    return this.compileContext(inputState, options);
+  }
+}
+
+export class TaskContextCompiler extends ContextCompiler {
+  constructor(config = {}) {
+    super({
+      ...config,
+      compressSummaries: true,
+      enforceJSONOutput: config.enforceJSONOutput !== false
+    });
+  }
+
+  compileTaskContext(task, agentResults = [], options = {}) {
+    const inputState = {
+      messages: [
+        { role: 'system', content: JSON_ONLY_INSTRUCTIONS },
+        { role: 'user', content: `Task: ${task.description}`, timestamp: task.createdAt },
+        ...agentResults.map((result, idx) => ({
+          role: 'assistant',
+          content: JSON.stringify({
+            agent: idx + 1,
+            result: result
+          }),
+          timestamp: Date.now()
+        }))
+      ],
+      metadata: {
+        taskId: task.id,
+        taskType: task.type,
+        priority: task.priority,
+        status: task.status
+      },
+      context: {
+        dependencies: task.dependencies,
+        handoffCount: task.handoffCount,
+        assignedTo: task.assignedTo
+      },
+      systemPrompt: options.systemPrompt || 'You are coordinating a multi-agent task. Respond with valid JSON only.'
+    };
+
+    return this.compileContext(inputState, options);
+  }
+}
+
+// ============================================================================
+// Export
+// ============================================================================
+
+export default ContextCompiler;
